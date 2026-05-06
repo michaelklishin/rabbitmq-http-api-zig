@@ -1,4 +1,4 @@
-# rabbitmq-http-api-client-zig
+# A Zig Client for the RabbitMQ HTTP API
 
 A Zig client for the [RabbitMQ management HTTP API](https://www.rabbitmq.com/docs/management).
 
