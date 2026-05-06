@@ -724,7 +724,6 @@ pub const StreamConsumerInfo = struct {
     properties: ?std.json.Value = null,
 };
 
-
 //
 // Auth Attempts
 //
