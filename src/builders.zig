@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ObjectMap = std.json.ObjectMap;
@@ -14,11 +17,11 @@ pub const XArgumentsBuilder = struct {
     failed: bool = false,
 
     pub fn init(allocator: Allocator) XArgumentsBuilder {
-        return .{ .map = ObjectMap.init(allocator), .allocator = allocator };
+        return .{ .map = .empty, .allocator = allocator };
     }
 
     pub fn deinit(self: *XArgumentsBuilder) void {
-        self.map.deinit();
+        self.map.deinit(self.allocator);
     }
 
     pub fn messageTtl(self: *XArgumentsBuilder, millis: i64) *XArgumentsBuilder {
@@ -111,6 +114,16 @@ pub const XArgumentsBuilder = struct {
         return self;
     }
 
+    pub fn initialClusterSize(self: *XArgumentsBuilder, size: i64) *XArgumentsBuilder {
+        self.put("x-initial-cluster-size", .{ .integer = size });
+        return self;
+    }
+
+    pub fn maxAge(self: *XArgumentsBuilder, age: []const u8) *XArgumentsBuilder {
+        self.put("x-max-age", .{ .string = age });
+        return self;
+    }
+
     pub fn custom(self: *XArgumentsBuilder, key: []const u8, value: Value) *XArgumentsBuilder {
         self.put(key, value);
         return self;
@@ -122,7 +135,7 @@ pub const XArgumentsBuilder = struct {
     }
 
     fn put(self: *XArgumentsBuilder, key: []const u8, value: Value) void {
-        self.map.put(key, value) catch {
+        self.map.put(self.allocator, key, value) catch {
             self.failed = true;
         };
     }
@@ -138,11 +151,11 @@ pub const PolicyDefinitionBuilder = struct {
     failed: bool = false,
 
     pub fn init(allocator: Allocator) PolicyDefinitionBuilder {
-        return .{ .map = ObjectMap.init(allocator), .allocator = allocator };
+        return .{ .map = .empty, .allocator = allocator };
     }
 
     pub fn deinit(self: *PolicyDefinitionBuilder) void {
-        self.map.deinit();
+        self.map.deinit(self.allocator);
     }
 
     pub fn messageTtl(self: *PolicyDefinitionBuilder, millis: i64) *PolicyDefinitionBuilder {
@@ -185,6 +198,66 @@ pub const PolicyDefinitionBuilder = struct {
         return self;
     }
 
+    pub fn expires(self: *PolicyDefinitionBuilder, millis: i64) *PolicyDefinitionBuilder {
+        self.put("expires", .{ .integer = millis });
+        return self;
+    }
+
+    pub fn maxAge(self: *PolicyDefinitionBuilder, age: []const u8) *PolicyDefinitionBuilder {
+        self.put("max-age", .{ .string = age });
+        return self;
+    }
+
+    pub fn maxInMemoryLength(self: *PolicyDefinitionBuilder, length: i64) *PolicyDefinitionBuilder {
+        self.put("max-in-memory-length", .{ .integer = length });
+        return self;
+    }
+
+    pub fn maxInMemoryBytes(self: *PolicyDefinitionBuilder, bytes: i64) *PolicyDefinitionBuilder {
+        self.put("max-in-memory-bytes", .{ .integer = bytes });
+        return self;
+    }
+
+    pub fn alternateExchange(self: *PolicyDefinitionBuilder, exchange: []const u8) *PolicyDefinitionBuilder {
+        self.put("alternate-exchange", .{ .string = exchange });
+        return self;
+    }
+
+    pub fn federationUpstream(self: *PolicyDefinitionBuilder, upstream: []const u8) *PolicyDefinitionBuilder {
+        self.put("federation-upstream", .{ .string = upstream });
+        return self;
+    }
+
+    pub fn federationUpstreamSet(self: *PolicyDefinitionBuilder, set: []const u8) *PolicyDefinitionBuilder {
+        self.put("federation-upstream-set", .{ .string = set });
+        return self;
+    }
+
+    pub fn queueLeaderLocator(self: *PolicyDefinitionBuilder, locator: commons.QueueLeaderLocator) *PolicyDefinitionBuilder {
+        self.put("queue-leader-locator", .{ .string = locator.toApiString() });
+        return self;
+    }
+
+    pub fn deadLetterStrategy(self: *PolicyDefinitionBuilder, strategy: commons.DeadLetterStrategy) *PolicyDefinitionBuilder {
+        self.put("dead-letter-strategy", .{ .string = strategy.toApiString() });
+        return self;
+    }
+
+    pub fn streamMaxSegmentSizeBytes(self: *PolicyDefinitionBuilder, bytes: i64) *PolicyDefinitionBuilder {
+        self.put("stream-max-segment-size-bytes", .{ .integer = bytes });
+        return self;
+    }
+
+    pub fn initialClusterSize(self: *PolicyDefinitionBuilder, size: i64) *PolicyDefinitionBuilder {
+        self.put("initial-cluster-size", .{ .integer = size });
+        return self;
+    }
+
+    pub fn targetGroupSize(self: *PolicyDefinitionBuilder, size: i64) *PolicyDefinitionBuilder {
+        self.put("target-group-size", .{ .integer = size });
+        return self;
+    }
+
     pub fn custom(self: *PolicyDefinitionBuilder, key: []const u8, value: Value) *PolicyDefinitionBuilder {
         self.put(key, value);
         return self;
@@ -196,7 +269,7 @@ pub const PolicyDefinitionBuilder = struct {
     }
 
     fn put(self: *PolicyDefinitionBuilder, key: []const u8, value: Value) void {
-        self.map.put(key, value) catch {
+        self.map.put(self.allocator, key, value) catch {
             self.failed = true;
         };
     }
@@ -250,4 +323,32 @@ test "PolicyDefinitionBuilder: custom key" {
     _ = b.custom("max-length-bytes", .{ .integer = 1048576 });
     const v = try b.build();
     try testing.expectEqual(@as(i64, 1048576), v.object.get("max-length-bytes").?.integer);
+}
+
+test "PolicyDefinitionBuilder: federation upstream and locator" {
+    var b = PolicyDefinitionBuilder.init(testing.allocator);
+    defer b.deinit();
+    _ = b.federationUpstream("up").queueLeaderLocator(.client_local).expires(1000);
+    const v = try b.build();
+    try testing.expectEqualStrings("up", v.object.get("federation-upstream").?.string);
+    try testing.expectEqualStrings("client-local", v.object.get("queue-leader-locator").?.string);
+    try testing.expectEqual(@as(i64, 1000), v.object.get("expires").?.integer);
+}
+
+test "XArgumentsBuilder: maxAge and initialClusterSize" {
+    var b = XArgumentsBuilder.init(testing.allocator);
+    defer b.deinit();
+    _ = b.maxAge("7D").initialClusterSize(3);
+    const v = try b.build();
+    try testing.expectEqualStrings("7D", v.object.get("x-max-age").?.string);
+    try testing.expectEqual(@as(i64, 3), v.object.get("x-initial-cluster-size").?.integer);
+}
+
+test "XArgumentsBuilder: queueLeaderLocator and deadLetterStrategy emit wire strings" {
+    var b = XArgumentsBuilder.init(testing.allocator);
+    defer b.deinit();
+    _ = b.queueLeaderLocator(.client_local).deadLetterStrategy(.at_least_once);
+    const v = try b.build();
+    try testing.expectEqualStrings("client-local", v.object.get("x-queue-leader-locator").?.string);
+    try testing.expectEqualStrings("at-least-once", v.object.get("x-dead-letter-strategy").?.string);
 }

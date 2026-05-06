@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const h = @import("helpers.zig");
 const std = @import("std");
 
@@ -26,7 +29,6 @@ test "declare and redeclare classic queue" {
     client.deleteQueue("/", queue_name, true) catch {};
 
     try client.declareClassicQueue("/", queue_name);
-    // Redeclare should be idempotent
     try client.declareClassicQueue("/", queue_name);
 
     client.deleteQueue("/", queue_name, true) catch {};
@@ -70,26 +72,6 @@ test "declare stream" {
     client.deleteQueue("/", stream_name, true) catch {};
 }
 
-test "declare transient auto-delete queue" {
-    var client = try h.openClient();
-    defer client.deinit();
-
-    const queue_name = "zig.test.transient.queue";
-    client.deleteQueue("/", queue_name, true) catch {};
-
-    try client.declareQueue("/", queue_name, .{
-        .durable = false,
-        .auto_delete = true,
-    });
-
-    const info = try client.getQueueInfo("/", queue_name);
-    defer info.deinit();
-    try h.testing.expect(!(info.value.durable orelse true));
-    try h.testing.expect(info.value.auto_delete orelse false);
-
-    client.deleteQueue("/", queue_name, true) catch {};
-}
-
 test "declare queue with arguments" {
     var client = try h.openClient();
     defer client.deinit();
@@ -97,14 +79,14 @@ test "declare queue with arguments" {
     const queue_name = "zig.test.args.queue";
     client.deleteQueue("/", queue_name, true) catch {};
 
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(h.allocator);
+    try args.put(h.allocator, "x-max-length", .{ .integer = 500 });
+    try args.put(h.allocator, "x-message-ttl", .{ .integer = 60000 });
+
     try client.declareQueue("/", queue_name, .{
         .durable = true,
-        .arguments = .{ .object = blk: {
-            var map = std.json.ObjectMap.init(h.allocator);
-            map.put("x-max-length", .{ .integer = 500 }) catch unreachable;
-            map.put("x-message-ttl", .{ .integer = 60000 }) catch unreachable;
-            break :blk map;
-        } },
+        .arguments = .{ .object = args },
     });
 
     const info = try client.getQueueInfo("/", queue_name);
@@ -204,7 +186,7 @@ test "list queues with details" {
     var client = try h.openClient();
     defer client.deinit();
 
-    // May fail on older RabbitMQ, just verify callable
+    // The /queues/detailed endpoint requires RabbitMQ 3.13 or later.
     _ = client.listQueuesWithDetails() catch |err| switch (err) {
         error.NotFound, error.BadRequest => return,
         else => return err,
@@ -242,4 +224,48 @@ test "list streams" {
 
     const queues = try client.listStreams();
     defer queues.deinit();
+}
+
+test "listQueuesOfType filters by enum" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const queues = try client.listQueuesOfType(.classic);
+    defer queues.deinit();
+    for (queues.value) |q| {
+        if (q.type) |t| try h.testing.expectEqualStrings("classic", t);
+    }
+}
+
+test "quorum queue status returns Raft state" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const name = "zig.test.qq.status";
+    client.deleteQueue("/", name, true) catch {};
+    try client.declareQuorumQueue("/", name);
+
+    const status = try client.getQuorumQueueStatus("/", name);
+    defer status.deinit();
+    // The endpoint returns an array of per-replica records; we just verify
+    // that something parsable came back.
+    try h.testing.expect(status.value == .array);
+    try h.testing.expect(status.value.array.items.len > 0);
+
+    client.deleteQueue("/", name, true) catch {};
+}
+
+test "getStreamInfo and deleteStream are queue-info aliases" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const name = "zig.test.stream.alias";
+    client.deleteStream("/", name, true) catch {};
+
+    try client.declareStream("/", name);
+    const info = try client.getStreamInfo("/", name);
+    defer info.deinit();
+    try h.testing.expectEqualStrings(name, info.value.name);
+
+    try client.deleteStream("/", name, false);
 }

@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 /// RabbitMQ HTTP API Client for Zig.
 ///
-/// An HTTP client for the RabbitMQ management API, using Zig's
-/// `std.Io` interface for pluggable I/O (threaded, async, simulated).
+/// HTTP client for the RabbitMQ management API, built on Zig's std.Io for
+/// pluggable I/O (threaded, async, simulated).
 pub const Client = @import("client.zig").Client;
 pub const ClientOptions = @import("client.zig").ClientOptions;
 pub const ClientError = @import("client.zig").ClientError;

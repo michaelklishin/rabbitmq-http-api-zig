@@ -1,5 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const h = @import("helpers.zig");
 const std = @import("std");
+
+const test_vhost = "zig.test.vhosts.vhost";
 
 test "list vhosts" {
     var client = try h.openClient();
@@ -20,26 +25,23 @@ test "create, get, update, and delete vhost" {
     var client = try h.openClient();
     defer client.deinit();
 
-    client.deleteVhost(h.test_vhost, true) catch {};
+    client.deleteVhost(test_vhost, true) catch {};
 
-    try client.createVhost(h.test_vhost, .{
+    try client.createVhost(test_vhost, .{
         .description = "Zig integration test vhost",
     });
 
-    const vhost = try client.getVhost(h.test_vhost);
+    const vhost = try client.getVhost(test_vhost);
     defer vhost.deinit();
-    try h.testing.expectEqualStrings(h.test_vhost, vhost.value.name);
+    try h.testing.expectEqualStrings(test_vhost, vhost.value.name);
 
-    // Update (createVhost is an upsert)
-    try client.createVhost(h.test_vhost, .{
+    try client.createVhost(test_vhost, .{
         .description = "Updated description",
     });
 
-    // Delete
-    try client.deleteVhost(h.test_vhost, false);
+    try client.deleteVhost(test_vhost, false);
 
-    // Verify deleted
-    const result = client.getVhost(h.test_vhost);
+    const result = client.getVhost(test_vhost);
     try h.testing.expectError(error.NotFound, result);
 }
 
@@ -89,13 +91,9 @@ test "virtual host deletion protection" {
 
     try client.enableVhostDeletionProtection(vh);
 
-    // Attempting to delete a protected vhost should fail
     if (client.deleteVhost(vh, false)) |_| {
-        // Unexpected success — clean up
         return error.Unexpected;
-    } else |_| {
-        // Expected: deletion of protected vhost fails
-    }
+    } else |_| {}
 
     try client.disableVhostDeletionProtection(vh);
     try client.deleteVhost(vh, false);
@@ -105,8 +103,62 @@ test "list vhosts paginated" {
     var client = try h.openClient();
     defer client.deinit();
 
-    // Not all RabbitMQ series support virtual host listing with pagination
+    // Older RabbitMQ versions don't support /vhosts pagination.
     const result = client.listVhostsPaged(.{ .page = 1, .page_size = 10 }) catch return;
     defer result.deinit();
     try h.testing.expect(result.value.items.len > 0);
+}
+
+test "updateVhost is an alias for createVhost (upsert)" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const vh = "zig.test.update.vhost";
+    client.deleteVhost(vh, true) catch {};
+    try client.createVhost(vh, .{ .description = "initial" });
+
+    try client.updateVhost(vh, .{ .description = "updated" });
+    const v = try client.getVhost(vh);
+    defer v.deinit();
+    if (v.value.description) |d| {
+        try h.testing.expectEqualStrings("updated", d);
+    }
+
+    client.deleteVhost(vh, true) catch {};
+}
+
+test "vhost with non-ASCII name round-trips" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const vh = "zig.test.unicode.café";
+    client.deleteVhost(vh, true) catch {};
+    try client.createVhost(vh, .{});
+
+    const v = try client.getVhost(vh);
+    defer v.deinit();
+    try h.testing.expectEqualStrings(vh, v.value.name);
+
+    client.deleteVhost(vh, true) catch {};
+}
+
+test "createVhost with default queue type via builder" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const vh = "zig.test.builder.vhost";
+    client.deleteVhost(vh, true) catch {};
+
+    const params = (h.api.requests.VirtualHostParams{})
+        .withDescription("builder constructed")
+        .withDefaultQueueType(.quorum);
+    try client.createVhost(vh, params);
+
+    const v = try client.getVhost(vh);
+    defer v.deinit();
+    if (v.value.default_queue_type) |dqt| {
+        try h.testing.expectEqualStrings("quorum", dqt);
+    }
+
+    client.deleteVhost(vh, true) catch {};
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const h = @import("helpers.zig");
 const std = @import("std");
 
@@ -54,4 +57,29 @@ test "list consumers by vhost" {
 
     const consumers = try client.listConsumersByVhost("/");
     defer consumers.deinit();
+}
+
+test "list connections paged" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const result = try client.listConnectionsPaged(.{ .page = 1, .page_size = 10 });
+    defer result.deinit();
+}
+
+test "list channels paged" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const result = try client.listChannelsPaged(.{ .page = 1, .page_size = 10 });
+    defer result.deinit();
+}
+
+test "list user connections returns empty for unknown user" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const conns = try client.listUserConnections("unknown-user-zig-test");
+    defer conns.deinit();
+    try h.testing.expect(conns.value.len == 0);
 }

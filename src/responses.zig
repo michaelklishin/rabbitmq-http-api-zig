@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const std = @import("std");
 
 //
@@ -12,6 +15,7 @@ pub fn PaginatedResponse(comptime T: type) type {
         page_size: ?u32 = null,
         total_count: ?u32 = null,
         filtered_count: ?u32 = null,
+        item_count: ?u32 = null,
     };
 }
 
@@ -48,6 +52,8 @@ pub const MessageStats = struct {
     redeliver_details: ?RateDetails = null,
     return_unroutable: ?u64 = null,
     return_unroutable_details: ?RateDetails = null,
+    drop_unroutable: ?u64 = null,
+    drop_unroutable_details: ?RateDetails = null,
     disk_reads: ?u64 = null,
     disk_writes: ?u64 = null,
 };
@@ -96,6 +102,7 @@ pub const Listener = struct {
     ip_address: ?[]const u8 = null,
     port: ?u16 = null,
     socket_opts: ?std.json.Value = null,
+    tls: ?bool = null,
 };
 
 pub const Overview = struct {
@@ -106,13 +113,24 @@ pub const Overview = struct {
     product_version: ?[]const u8 = null,
     erlang_version: ?[]const u8 = null,
     erlang_full_version: ?[]const u8 = null,
+    crypto_lib_version: ?[]const u8 = null,
     cluster_name: ?[]const u8 = null,
+    cluster_tags: ?std.json.Value = null,
     node: ?[]const u8 = null,
+    node_tags: ?std.json.Value = null,
+    disable_stats: ?bool = null,
+    enable_queue_totals: ?bool = null,
+    is_op_policy_updating_enabled: ?bool = null,
+    default_queue_type: ?[]const u8 = null,
+    statistics_db_event_queue: ?u64 = null,
     message_stats: ?MessageStats = null,
     object_totals: ?ObjectTotals = null,
     queue_totals: ?QueueTotals = null,
     churn_rates: ?ChurnRates = null,
     listeners: ?[]Listener = null,
+    contexts: ?std.json.Value = null,
+    exchange_types: ?std.json.Value = null,
+    sample_retention_policies: ?std.json.Value = null,
 };
 
 //
@@ -153,10 +171,47 @@ pub const ClusterNode = struct {
     io_write_bytes: ?u64 = null,
     rates_mode: ?[]const u8 = null,
     enabled_plugins: ?[][]const u8 = null,
+    cluster_links: ?std.json.Value = null,
+    db_dir: ?[]const u8 = null,
+    config_files: ?std.json.Value = null,
+    log_files: ?std.json.Value = null,
 };
 
 pub const NodeMemoryFootprint = struct {
-    memory: ?MemoryBreakdown = null,
+    memory: ?MemoryFootprintField = null,
+};
+
+/// The /nodes/:name/memory endpoint normally returns an object, but the
+/// broker occasionally returns a sentinel string (e.g. `"not_available"`)
+/// when memory stats are still being collected.
+pub const MemoryFootprintField = union(enum) {
+    breakdown: MemoryBreakdown,
+    sentinel: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !MemoryFootprintField {
+        switch (try source.peekNextTokenType()) {
+            .string => {
+                const tok = try source.nextAllocMax(allocator, .alloc_always, options.max_value_len.?);
+                const text = switch (tok) {
+                    .string, .allocated_string => |s| s,
+                    else => return error.UnexpectedToken,
+                };
+                return .{ .sentinel = text };
+            },
+            .object_begin => {
+                const inner = try std.json.innerParse(MemoryBreakdown, allocator, source, options);
+                return .{ .breakdown = inner };
+            },
+            else => return error.UnexpectedToken,
+        }
+    }
+
+    pub fn breakdownOrNull(self: MemoryFootprintField) ?MemoryBreakdown {
+        return switch (self) {
+            .breakdown => |b| b,
+            .sentinel => null,
+        };
+    }
 };
 
 pub const MemoryBreakdown = struct {
@@ -176,6 +231,7 @@ pub const MemoryBreakdown = struct {
     metrics: ?u64 = null,
     mgmt_db: ?u64 = null,
     mnesia: ?u64 = null,
+    quorum_ets: ?u64 = null,
     other_ets: ?u64 = null,
     binary: ?u64 = null,
     msg_index: ?u64 = null,
@@ -185,11 +241,21 @@ pub const MemoryBreakdown = struct {
     allocated_unused: ?u64 = null,
     reserved_unallocated: ?u64 = null,
     total: ?std.json.Value = null,
+    strategy: ?[]const u8 = null,
 };
 
 //
 // Connections
 //
+
+pub const ClientCapabilities = struct {
+    authentication_failure_close: ?bool = null,
+    @"basic.nack": ?bool = null,
+    @"connection.blocked": ?bool = null,
+    consumer_cancel_notify: ?bool = null,
+    exchange_exchange_bindings: ?bool = null,
+    publisher_confirms: ?bool = null,
+};
 
 pub const ClientProperties = struct {
     connection_name: ?[]const u8 = null,
@@ -221,6 +287,10 @@ pub const ConnectionInfo = struct {
     ssl_protocol: ?[]const u8 = null,
     ssl_hash: ?[]const u8 = null,
     ssl_cipher: ?[]const u8 = null,
+    ssl_key_exchange: ?[]const u8 = null,
+    peer_cert_subject: ?[]const u8 = null,
+    peer_cert_issuer: ?[]const u8 = null,
+    peer_cert_validity: ?[]const u8 = null,
     recv_oct: ?u64 = null,
     recv_cnt: ?u64 = null,
     send_oct: ?u64 = null,
@@ -234,6 +304,12 @@ pub const UserConnectionInfo = struct {
     user: ?[]const u8 = null,
     vhost: ?[]const u8 = null,
     node: ?[]const u8 = null,
+};
+
+pub const ConnectionDetails = struct {
+    name: ?[]const u8 = null,
+    peer_host: ?[]const u8 = null,
+    peer_port: ?u16 = null,
 };
 
 //
@@ -260,25 +336,20 @@ pub const ChannelInfo = struct {
     message_stats: ?MessageStats = null,
 };
 
-pub const ConnectionDetails = struct {
-    name: ?[]const u8 = null,
-    peer_host: ?[]const u8 = null,
-    peer_port: ?u16 = null,
-};
-
 //
 // Consumers
 //
 
 pub const ConsumerInfo = struct {
     consumer_tag: ?[]const u8 = null,
-    channel_details: ?ConnectionDetails = null,
+    channel_details: ?std.json.Value = null,
     queue: ?ConsumerQueue = null,
     ack_required: ?bool = null,
     exclusive: ?bool = null,
     active: ?bool = null,
     activity_status: ?[]const u8 = null,
     prefetch_count: ?u32 = null,
+    consumer_timeout: ?u64 = null,
     arguments: ?std.json.Value = null,
 };
 
@@ -298,26 +369,36 @@ pub const QueueInfo = struct {
     durable: ?bool = null,
     exclusive: ?bool = null,
     auto_delete: ?bool = null,
+    internal: ?bool = null,
+    internal_owner: ?bool = null,
     messages: ?u64 = null,
     messages_ready: ?u64 = null,
     messages_unacknowledged: ?u64 = null,
     messages_details: ?RateDetails = null,
     messages_ready_details: ?RateDetails = null,
     messages_unacknowledged_details: ?RateDetails = null,
+    messages_persistent: ?u64 = null,
+    messages_ram: ?u64 = null,
     consumers: ?u32 = null,
+    consumer_utilisation: ?f32 = null,
+    consumer_capacity: ?f32 = null,
     state: ?[]const u8 = null,
     type: ?[]const u8 = null,
     policy: ?[]const u8 = null,
+    operator_policy: ?[]const u8 = null,
+    effective_policy_definition: ?std.json.Value = null,
     arguments: ?std.json.Value = null,
     memory: ?u64 = null,
     message_bytes: ?u64 = null,
     message_bytes_ready: ?u64 = null,
     message_bytes_unacknowledged: ?u64 = null,
     message_bytes_persistent: ?u64 = null,
+    message_bytes_ram: ?u64 = null,
     message_stats: ?MessageStats = null,
     leader: ?[]const u8 = null,
     members: ?[][]const u8 = null,
     online: ?[][]const u8 = null,
+    exclusive_consumer_tag: ?[]const u8 = null,
 };
 
 //
@@ -335,6 +416,9 @@ pub const ExchangeInfo = struct {
     message_stats: ?MessageStats = null,
     policy: ?[]const u8 = null,
     user_who_performed_action: ?[]const u8 = null,
+    /// Lists of bindings used by `/exchanges/:vhost/:exchange` for stats views.
+    incoming: ?std.json.Value = null,
+    outgoing: ?std.json.Value = null,
 };
 
 //
@@ -365,7 +449,16 @@ pub const VhostInfo = struct {
     messages: ?u64 = null,
     messages_ready: ?u64 = null,
     messages_unacknowledged: ?u64 = null,
+    messages_details: ?RateDetails = null,
+    messages_ready_details: ?RateDetails = null,
+    messages_unacknowledged_details: ?RateDetails = null,
+    recv_oct: ?u64 = null,
+    recv_oct_details: ?RateDetails = null,
+    send_oct: ?u64 = null,
+    send_oct_details: ?RateDetails = null,
+    message_stats: ?MessageStats = null,
     metadata: ?std.json.Value = null,
+    protected_from_deletion: ?bool = null,
 };
 
 //
@@ -383,6 +476,7 @@ pub const UserInfo = struct {
 pub const CurrentUser = struct {
     name: ?[]const u8 = null,
     tags: ?std.json.Value = null,
+    is_internal_user: ?bool = null,
     auth_backend: ?[]const u8 = null,
 };
 
@@ -429,6 +523,8 @@ pub const FeatureFlagInfo = struct {
     doc_url: ?[]const u8 = null,
     state: ?[]const u8 = null,
     stability: ?[]const u8 = null,
+    require_level: ?[]const u8 = null,
+    experiment_level: ?[]const u8 = null,
     provided_by: ?[]const u8 = null,
 };
 
@@ -439,8 +535,11 @@ pub const FeatureFlagInfo = struct {
 pub const DeprecatedFeatureInfo = struct {
     name: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    desc: ?[]const u8 = null,
+    state: ?[]const u8 = null,
     deprecation_phase: ?[]const u8 = null,
     provided_by: ?[]const u8 = null,
+    doc_url: ?[]const u8 = null,
 };
 
 //
@@ -458,9 +557,15 @@ pub const HealthCheckResult = struct {
 //
 
 pub const DefinitionSet = struct {
+    rabbit_version: ?[]const u8 = null,
     rabbitmq_version: ?[]const u8 = null,
+    rabbitmq_definition_format: ?[]const u8 = null,
+    original_vhost_name: ?[]const u8 = null,
     product_name: ?[]const u8 = null,
     product_version: ?[]const u8 = null,
+    explanation: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    metadata: ?std.json.Value = null,
     users: ?std.json.Value = null,
     vhosts: ?std.json.Value = null,
     permissions: ?std.json.Value = null,
@@ -468,6 +573,7 @@ pub const DefinitionSet = struct {
     parameters: ?std.json.Value = null,
     global_parameters: ?std.json.Value = null,
     policies: ?std.json.Value = null,
+    limits: ?std.json.Value = null,
     queues: ?std.json.Value = null,
     exchanges: ?std.json.Value = null,
     bindings: ?std.json.Value = null,
@@ -523,6 +629,8 @@ pub const FederationLink = struct {
     queue: ?[]const u8 = null,
     exchange: ?[]const u8 = null,
     upstream: ?[]const u8 = null,
+    upstream_queue: ?[]const u8 = null,
+    upstream_exchange: ?[]const u8 = null,
     vhost: ?[]const u8 = null,
     type: ?[]const u8 = null,
     status: ?[]const u8 = null,
@@ -531,6 +639,7 @@ pub const FederationLink = struct {
     timestamp: ?[]const u8 = null,
     id: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+    consumer_tag: ?[]const u8 = null,
 };
 
 //
@@ -542,12 +651,26 @@ pub const ShovelStatus = struct {
     vhost: ?[]const u8 = null,
     type: ?[]const u8 = null,
     state: ?[]const u8 = null,
+    publishing_state: ?[]const u8 = null,
+    blocked_status: ?[]const u8 = null,
     node: ?[]const u8 = null,
     timestamp: ?[]const u8 = null,
     src_uri: ?[]const u8 = null,
     src_protocol: ?[]const u8 = null,
+    src_queue: ?[]const u8 = null,
+    src_exchange: ?[]const u8 = null,
+    src_exchange_key: ?[]const u8 = null,
     dest_uri: ?[]const u8 = null,
     dest_protocol: ?[]const u8 = null,
+    dest_queue: ?[]const u8 = null,
+    dest_exchange: ?[]const u8 = null,
+    dest_exchange_key: ?[]const u8 = null,
+    pending: ?u64 = null,
+    forwarded: ?u64 = null,
+    // `remaining` and `remaining_unacked` are either integers or the string
+    // "unlimited", so they are typed as Value to accept both.
+    remaining: ?std.json.Value = null,
+    remaining_unacked: ?std.json.Value = null,
 };
 
 //
@@ -568,6 +691,7 @@ pub const StreamConnectionInfo = struct {
     ssl: ?bool = null,
     frame_max: ?u32 = null,
     heartbeat: ?u32 = null,
+    auth_mechanism: ?[]const u8 = null,
     client_properties: ?std.json.Value = null,
 };
 
@@ -575,20 +699,24 @@ pub const StreamPublisherInfo = struct {
     reference: ?[]const u8 = null,
     publisher_id: ?u32 = null,
     stream: ?[]const u8 = null,
+    queue: ?ConsumerQueue = null,
     connection_details: ?ConnectionDetails = null,
     node: ?[]const u8 = null,
     messages_published: ?u64 = null,
-    messages_confirmed: ?u64 = null,
-    messages_errored: ?u64 = null,
+    published: ?u64 = null,
+    confirmed: ?u64 = null,
+    errored: ?u64 = null,
 };
 
 pub const StreamConsumerInfo = struct {
     stream: ?[]const u8 = null,
+    queue: ?ConsumerQueue = null,
     subscription_id: ?u32 = null,
-    credits: ?u32 = null,
+    credits: ?u64 = null,
     connection_details: ?ConnectionDetails = null,
     node: ?[]const u8 = null,
     messages_consumed: ?u64 = null,
+    consumed: ?u64 = null,
     offset: ?u64 = null,
     offset_lag: ?u64 = null,
     active: ?bool = null,
@@ -596,39 +724,22 @@ pub const StreamConsumerInfo = struct {
     properties: ?std.json.Value = null,
 };
 
-//
-// Plugins
-//
-
-pub const PluginInfo = struct {
-    name: ?[]const u8 = null,
-    version: ?[]const u8 = null,
-    description: ?[]const u8 = null,
-    enabled: ?[]const u8 = null,
-    running: ?bool = null,
-    dependencies: ?[][]const u8 = null,
-};
-
-//
-// OAuth Configuration
-//
-
-pub const OAuthConfiguration = struct {
-    oauth_enabled: ?bool = null,
-    oauth_client_id: ?[]const u8 = null,
-    oauth_provider_url: ?[]const u8 = null,
-};
 
 //
 // Auth Attempts
 //
 
+/// /auth/attempts/:node returns per-protocol auth statistics, not individual
+/// attempt records.
 pub const AuthAttemptInfo = struct {
-    username: ?[]const u8 = null,
-    auth_mechanism: ?[]const u8 = null,
-    remote_address: ?[]const u8 = null,
     protocol: ?[]const u8 = null,
-    timestamp: ?u64 = null,
+    auth_attempts: ?u64 = null,
+    auth_attempts_failed: ?u64 = null,
+    auth_attempts_succeeded: ?u64 = null,
+    /// Populated only by the by-source variant.
+    remote_address: ?[]const u8 = null,
+    /// Populated only by the by-source variant.
+    username: ?[]const u8 = null,
 };
 
 //
@@ -651,14 +762,6 @@ pub const PublishResult = struct {
 };
 
 //
-// Extensions
-//
-
-pub const ExtensionInfo = struct {
-    javascript: ?[]const u8 = null,
-};
-
-//
 // Schema Replication
 //
 
@@ -667,10 +770,26 @@ pub const SchemaReplicationStatus = struct {
 };
 
 //
+// Hash Password
+//
+
+pub const HashPasswordResult = struct {
+    ok: ?[]const u8 = null,
+};
+
+//
+// Reachability Probe
+//
+
+pub const ReachabilityProbeOutcome = struct {
+    successful: bool,
+};
+
+//
 // Error Details
 //
 
-/// The RabbitMQ API returns {"error":"...", "reason":"..."} on errors.
+/// The HTTP API returns {"error":"...", "reason":"..."} on most error responses.
 pub const ErrorDetails = struct {
     @"error": ?[]const u8 = null,
     reason: ?[]const u8 = null,

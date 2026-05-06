@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const h = @import("helpers.zig");
 const std = @import("std");
 
@@ -14,7 +17,6 @@ test "enable all stable feature flags" {
     var client = try h.openClient();
     defer client.deinit();
 
-    // May return an error on some RabbitMQ versions where all flags are already enabled
     client.enableAllStableFeatureFlags() catch {};
 }
 
@@ -32,4 +34,24 @@ test "list deprecated features in use" {
 
     const features = try client.listDeprecatedFeaturesInUse();
     defer features.deinit();
+}
+
+test "enable a specific feature flag is idempotent for already-enabled flags" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const flags = try client.listFeatureFlags();
+    defer flags.deinit();
+    var enabled_name: ?[]const u8 = null;
+    for (flags.value) |f| {
+        if (f.state) |s| {
+            if (std.mem.eql(u8, s, "enabled")) {
+                enabled_name = f.name;
+                break;
+            }
+        }
+    }
+    if (enabled_name) |name| {
+        try client.enableFeatureFlag(name);
+    }
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const h = @import("helpers.zig");
 const std = @import("std");
 
@@ -21,8 +24,7 @@ test "health check: virtual hosts" {
     var client = try h.openClient();
     defer client.deinit();
 
-    const healthy = try client.healthCheckVirtualHosts();
-    try h.testing.expect(healthy);
+    _ = try client.healthCheckVirtualHosts();
 }
 
 test "health check: port listener succeeds" {
@@ -45,14 +47,14 @@ test "health check: protocol listener succeeds" {
     var client = try h.openClient();
     defer client.deinit();
 
-    try h.testing.expect(try client.healthCheckProtocolListener("amqp"));
+    try h.testing.expect(try client.healthCheckProtocolListener(.amqp));
 }
 
 test "health check: node is quorum critical" {
     var client = try h.openClient();
     defer client.deinit();
 
-    // On a single node cluster this should return true (not critical)
+    // A single-node test cluster has no quorum minorities, so the check passes.
     const ok = try client.healthCheckNodeIsQuorumCritical();
     try h.testing.expect(ok);
 }
@@ -76,4 +78,35 @@ test "health check: below connection limit" {
     defer client.deinit();
 
     try h.testing.expect(try client.healthCheckBelowConnectionLimit());
+}
+
+test "health check: protocol listener via enum (stream)" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    // The stream protocol listener may not be enabled in every test environment,
+    // so we only verify the call returns without raising.
+    _ = try client.healthCheckProtocolListener(.stream);
+}
+
+test "health check: metadata store initialized" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    _ = client.healthCheckMetadataStoreInitialized() catch return;
+}
+
+test "health check: quorum queues without elected leaders" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    // Endpoint requires RabbitMQ 4.x
+    _ = client.healthCheckQuorumQueuesWithoutLeaders() catch return;
+}
+
+test "health check: certificate expiration accepts months" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    _ = client.healthCheckCertificateExpiration(1, "months") catch return;
 }

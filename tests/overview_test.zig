@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const h = @import("helpers.zig");
 const std = @import("std");
 
@@ -35,21 +38,12 @@ test "get and set cluster name" {
     try h.testing.expect(original.value.name != null);
 
     try client.setClusterName("zig-test-cluster");
+    // Restore the original name even if a later assertion fails.
+    defer client.setClusterName(original.value.name.?) catch {};
+
     const updated = try client.getClusterName();
     defer updated.deinit();
     try h.testing.expectEqualStrings("zig-test-cluster", updated.value.name.?);
-
-    // Restore
-    try client.setClusterName(original.value.name.?);
-}
-
-test "get effective config" {
-    var client = try h.openClient();
-    defer client.deinit();
-
-    // May return non-JSON on some versions
-    const config = client.getEffectiveConfig() catch return;
-    defer config.deinit();
 }
 
 test "rebalance queue leaders" {
@@ -57,4 +51,29 @@ test "rebalance queue leaders" {
     defer client.deinit();
 
     client.rebalanceQueueLeaders() catch {};
+}
+
+test "server version returns a non-empty string" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const v = try client.serverVersion();
+    defer h.allocator.free(v);
+    try h.testing.expect(v.len > 0);
+}
+
+test "reachability probe succeeds against a healthy broker" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const outcome = client.probeReachability();
+    try h.testing.expect(outcome.successful);
+}
+
+test "aliveness test on default vhost" {
+    var client = try h.openClient();
+    defer client.deinit();
+
+    const ok = try client.alivenessTest("/");
+    try h.testing.expect(ok);
 }

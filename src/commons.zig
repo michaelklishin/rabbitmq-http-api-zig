@@ -1,6 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
+const std = @import("std");
+
 //
-// Exchange Types
+// Pagination
 //
+
+pub const default_page_size: u32 = 100;
+pub const max_page_size: u32 = 500;
 
 //
 // Exchange Types
@@ -46,12 +54,14 @@ pub const QueueType = enum {
     classic,
     quorum,
     stream,
+    delayed,
 
     pub fn toApiString(self: QueueType) []const u8 {
         return switch (self) {
             .classic => "classic",
             .quorum => "quorum",
             .stream => "stream",
+            .delayed => "delayed",
         };
     }
 };
@@ -77,6 +87,15 @@ pub const PolicyTarget = enum {
             .exchanges => "exchanges",
             .all => "all",
         };
+    }
+
+    pub fn doesApplyTo(self: PolicyTarget, other: PolicyTarget) bool {
+        if (self == other) return true;
+        if (self == .all) return other != .exchanges;
+        if (self == .queues) {
+            return other == .classic_queues or other == .quorum_queues or other == .streams;
+        }
+        return false;
     }
 };
 
@@ -130,6 +149,13 @@ pub const BindingDestinationType = enum {
         return switch (self) {
             .queue => "queue",
             .exchange => "exchange",
+        };
+    }
+
+    pub fn pathAbbreviation(self: BindingDestinationType) []const u8 {
+        return switch (self) {
+            .queue => "q",
+            .exchange => "e",
         };
     }
 };
@@ -216,50 +242,132 @@ pub const UserLimitTarget = enum {
     }
 };
 
-const std = @import("std");
-
 //
-// Password Hashing
+// TLS Peer Verification
 //
 
-pub fn saltedPasswordHashSha256(salt: [4]u8, password: []const u8) [32]u8 {
+pub const TlsPeerVerificationMode = enum {
+    enabled,
+    disabled,
+
+    pub fn toApiString(self: TlsPeerVerificationMode) []const u8 {
+        return switch (self) {
+            .enabled => "verify_peer",
+            .disabled => "verify_none",
+        };
+    }
+};
+
+//
+// Message Transfer Acknowledgement Mode
+//
+
+pub const MessageTransferAcknowledgementMode = enum {
+    immediate,
+    when_published,
+    when_confirmed,
+
+    pub fn toApiString(self: MessageTransferAcknowledgementMode) []const u8 {
+        return switch (self) {
+            .immediate => "no-ack",
+            .when_published => "on-publish",
+            .when_confirmed => "on-confirm",
+        };
+    }
+};
+
+//
+// Channel Use Mode (Federation)
+//
+
+pub const ChannelUseMode = enum {
+    multiple,
+    single,
+
+    pub fn toApiString(self: ChannelUseMode) []const u8 {
+        return switch (self) {
+            .multiple => "multiple",
+            .single => "single",
+        };
+    }
+};
+
+//
+// Federation Resource Cleanup Mode
+//
+
+pub const FederationResourceCleanupMode = enum {
+    default,
+    never,
+
+    pub fn toApiString(self: FederationResourceCleanupMode) []const u8 {
+        return switch (self) {
+            .default => "default",
+            .never => "never",
+        };
+    }
+};
+
+//
+// Password Hashing Algorithm
+//
+
+pub const HashingAlgorithm = enum {
+    sha256,
+    sha512,
+
+    pub fn toApiString(self: HashingAlgorithm) []const u8 {
+        return switch (self) {
+            .sha256 => "rabbit_password_hashing_sha256",
+            .sha512 => "rabbit_password_hashing_sha512",
+        };
+    }
+};
+
+//
+// Password Hashing Helpers
+//
+
+/// Fills a 4-byte salt from the platform secure RNG. Pass the same `Io`
+/// instance used by your `Client`.
+pub fn salt(io: std.Io) ![4]u8 {
+    var s: [4]u8 = undefined;
+    try std.Io.randomSecure(io, &s);
+    return s;
+}
+
+pub fn saltedPasswordHashSha256(s: [4]u8, password: []const u8) [32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(&salt);
+    h.update(&s);
     h.update(password);
     return h.finalResult();
 }
 
-pub fn saltedPasswordHashSha512(salt: [4]u8, password: []const u8) [64]u8 {
+pub fn saltedPasswordHashSha512(s: [4]u8, password: []const u8) [64]u8 {
     var h = std.crypto.hash.sha2.Sha512.init(.{});
-    h.update(&salt);
+    h.update(&s);
     h.update(password);
     return h.finalResult();
 }
 
-pub fn base64EncodedSaltedPasswordHashSha256(salt: [4]u8, password: []const u8) [52]u8 {
-    const hash = saltedPasswordHashSha256(salt, password);
-    var salted: [4 + 32]u8 = undefined;
-    @memcpy(salted[0..4], &salt);
-    @memcpy(salted[4..], &hash);
-    var out: [52]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&out, &salted);
+pub fn base64EncodedSaltedPasswordHashSha256(s: [4]u8, password: []const u8) [48]u8 {
+    const hash = saltedPasswordHashSha256(s, password);
+    var combined: [4 + 32]u8 = undefined;
+    @memcpy(combined[0..4], &s);
+    @memcpy(combined[4..], &hash);
+    var out: [48]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&out, &combined);
     return out;
 }
 
-pub fn base64EncodedSaltedPasswordHashSha512(salt: [4]u8, password: []const u8) [96]u8 {
-    const hash = saltedPasswordHashSha512(salt, password);
-    var salted: [4 + 64]u8 = undefined;
-    @memcpy(salted[0..4], &salt);
-    @memcpy(salted[4..], &hash);
-    var out: [96]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&out, &salted);
+pub fn base64EncodedSaltedPasswordHashSha512(s: [4]u8, password: []const u8) [92]u8 {
+    const hash = saltedPasswordHashSha512(s, password);
+    var combined: [4 + 64]u8 = undefined;
+    @memcpy(combined[0..4], &s);
+    @memcpy(combined[4..], &hash);
+    var out: [92]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&out, &combined);
     return out;
-}
-
-pub fn generateSalt() [4]u8 {
-    var salt: [4]u8 = undefined;
-    std.crypto.random.bytes(&salt);
-    return salt;
 }
 
 //
@@ -268,16 +376,18 @@ pub fn generateSalt() [4]u8 {
 
 const testing = std.testing;
 
-test "ExchangeType.toApiString" {
+test "ExchangeType.toApiString covers plugin-provided types" {
     try testing.expectEqualStrings("fanout", ExchangeType.fanout.toApiString());
     try testing.expectEqualStrings("x-consistent-hash", ExchangeType.consistent_hashing.toApiString());
     try testing.expectEqualStrings("x-local-random", ExchangeType.local_random.toApiString());
+    try testing.expectEqualStrings("x-delayed-message", ExchangeType.delayed_message.toApiString());
 }
 
 test "QueueType.toApiString" {
     try testing.expectEqualStrings("classic", QueueType.classic.toApiString());
     try testing.expectEqualStrings("quorum", QueueType.quorum.toApiString());
     try testing.expectEqualStrings("stream", QueueType.stream.toApiString());
+    try testing.expectEqualStrings("delayed", QueueType.delayed.toApiString());
 }
 
 test "PolicyTarget.toApiString" {
@@ -286,11 +396,27 @@ test "PolicyTarget.toApiString" {
     try testing.expectEqualStrings("all", PolicyTarget.all.toApiString());
 }
 
+test "PolicyTarget.doesApplyTo" {
+    try testing.expect(PolicyTarget.queues.doesApplyTo(.classic_queues));
+    try testing.expect(PolicyTarget.queues.doesApplyTo(.quorum_queues));
+    try testing.expect(PolicyTarget.queues.doesApplyTo(.streams));
+    try testing.expect(!PolicyTarget.queues.doesApplyTo(.exchanges));
+    try testing.expect(PolicyTarget.all.doesApplyTo(.queues));
+    try testing.expect(!PolicyTarget.all.doesApplyTo(.exchanges));
+    try testing.expect(PolicyTarget.exchanges.doesApplyTo(.exchanges));
+}
+
 test "SupportedProtocol.toApiString" {
     try testing.expectEqualStrings("amqp", SupportedProtocol.amqp.toApiString());
     try testing.expectEqualStrings("amqp/ssl", SupportedProtocol.amqp_tls.toApiString());
     try testing.expectEqualStrings("stream", SupportedProtocol.stream.toApiString());
     try testing.expectEqualStrings("https", SupportedProtocol.http_tls.toApiString());
+}
+
+test "BindingDestinationType helpers" {
+    try testing.expectEqualStrings("queue", BindingDestinationType.queue.toApiString());
+    try testing.expectEqualStrings("q", BindingDestinationType.queue.pathAbbreviation());
+    try testing.expectEqualStrings("e", BindingDestinationType.exchange.pathAbbreviation());
 }
 
 test "OverflowBehavior.toApiString" {
@@ -319,21 +445,44 @@ test "UserLimitTarget.toApiString" {
     try testing.expectEqualStrings("max-channels", UserLimitTarget.max_channels.toApiString());
 }
 
+test "MessageTransferAcknowledgementMode.toApiString" {
+    try testing.expectEqualStrings("no-ack", MessageTransferAcknowledgementMode.immediate.toApiString());
+    try testing.expectEqualStrings("on-publish", MessageTransferAcknowledgementMode.when_published.toApiString());
+    try testing.expectEqualStrings("on-confirm", MessageTransferAcknowledgementMode.when_confirmed.toApiString());
+}
+
+test "HashingAlgorithm.toApiString" {
+    try testing.expectEqualStrings("rabbit_password_hashing_sha256", HashingAlgorithm.sha256.toApiString());
+    try testing.expectEqualStrings("rabbit_password_hashing_sha512", HashingAlgorithm.sha512.toApiString());
+}
+
 test "saltedPasswordHashSha256 is deterministic" {
-    const salt = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
-    const h1 = saltedPasswordHashSha256(salt, "guest");
-    const h2 = saltedPasswordHashSha256(salt, "guest");
+    const s = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const h1 = saltedPasswordHashSha256(s, "guest");
+    const h2 = saltedPasswordHashSha256(s, "guest");
     try testing.expectEqualSlices(u8, &h1, &h2);
 }
 
+test "different salts produce different hashes" {
+    const a = saltedPasswordHashSha256([4]u8{ 1, 2, 3, 4 }, "p");
+    const b = saltedPasswordHashSha256([4]u8{ 5, 6, 7, 8 }, "p");
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
 test "base64EncodedSaltedPasswordHashSha256 produces valid base64" {
-    const salt = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const encoded = base64EncodedSaltedPasswordHashSha256(salt, "test");
-    try testing.expect(encoded.len == 52);
+    const s = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const encoded = base64EncodedSaltedPasswordHashSha256(s, "test");
+    try testing.expect(encoded.len == 48);
+    var decoded: [36]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&decoded, &encoded);
+    try testing.expectEqualSlices(u8, &s, decoded[0..4]);
 }
 
 test "base64EncodedSaltedPasswordHashSha512 produces valid base64" {
-    const salt = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
-    const encoded = base64EncodedSaltedPasswordHashSha512(salt, "test");
-    try testing.expect(encoded.len == 96);
+    const s = [4]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const encoded = base64EncodedSaltedPasswordHashSha512(s, "test");
+    try testing.expect(encoded.len == 92);
+    var decoded: [68]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&decoded, &encoded);
+    try testing.expectEqualSlices(u8, &s, decoded[0..4]);
 }

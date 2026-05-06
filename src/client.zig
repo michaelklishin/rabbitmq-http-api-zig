@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const std = @import("std");
 const http = std.http;
 const Allocator = std.mem.Allocator;
@@ -10,8 +13,10 @@ pub const ClientError = error{
     JsonParseFailed,
     NotFound,
     Unauthorized,
+    Forbidden,
     ServerError,
     BadRequest,
+    Conflict,
     OutOfMemory,
     Unexpected,
 };
@@ -20,9 +25,8 @@ pub const ClientOptions = struct {
     endpoint: []const u8 = "http://localhost:15672/api",
     username: []const u8 = "guest",
     password: []const u8 = "guest",
-    /// Absolute path to a PEM CA certificate file for TLS verification.
-    /// When set, the certificate is loaded and used to verify the server.
-    /// Required for self-signed certificates (e.g. from tls-gen).
+    /// Absolute path to a CA bundle file in the PEM format. When set, the system trust
+    /// store is bypassed.
     ca_cert_file: ?[]const u8 = null,
 };
 
@@ -48,7 +52,8 @@ pub const Client = struct {
         };
 
         if (options.ca_cert_file) |ca_path| {
-            // Set now so the http.Client uses our ca_bundle instead of rescanning system certs
+            // Pre-set `now` so the http.Client uses our pre-loaded bundle instead
+            // of rescanning system trust roots on first use.
             const now = std.Io.Clock.real.now(io);
             client.http_client.now = now;
             client.http_client.ca_bundle.addCertsFromFilePathAbsolute(
@@ -75,6 +80,16 @@ pub const Client = struct {
         return self.getJson(responses.Overview, "/overview");
     }
 
+    /// Returns a heap-allocated copy of the broker version. Caller owns the slice.
+    /// Uses the lightweight /version endpoint instead of /overview.
+    pub fn serverVersion(self: *Client) ![]u8 {
+        const body = try self.httpGet("/version");
+        defer self.allocator.free(body);
+        // Body is a JSON-quoted string like "\"4.3.0\"". Strip the quotes.
+        if (body.len < 2 or body[0] != '"' or body[body.len - 1] != '"') return error.JsonParseFailed;
+        return self.allocator.dupe(u8, body[1 .. body.len - 1]);
+    }
+
     pub fn getClusterName(self: *Client) !std.json.Parsed(responses.ClusterIdentity) {
         return self.getJson(responses.ClusterIdentity, "/cluster-name");
     }
@@ -83,16 +98,23 @@ pub const Client = struct {
         try self.putJson("/cluster-name", requests.ClusterNameParams{ .name = name });
     }
 
-    pub fn getClusterTags(self: *Client) !std.json.Parsed(std.json.Value) {
-        return self.getJson(std.json.Value, "/cluster/tags");
+    /// Cluster tags are stored as a global runtime parameter named "cluster_tags".
+    pub fn getClusterTags(self: *Client) !std.json.Parsed(responses.GlobalParameter) {
+        return self.getGlobalParameter("cluster_tags");
     }
 
-    pub fn setClusterTags(self: *Client, tags_json: []const u8) !void {
-        try self.httpSend(.PUT, "/cluster/tags", tags_json);
+    pub fn setClusterTags(self: *Client, tags: std.json.Value) !void {
+        try self.upsertGlobalParameter("cluster_tags", .{ .value = tags });
     }
 
     pub fn clearClusterTags(self: *Client) !void {
-        try self.httpSend(.PUT, "/cluster/tags", "{}");
+        try self.deleteGlobalParameter("cluster_tags", true);
+    }
+
+    /// Probes /whoami; succeeds when the broker is reachable and credentials work.
+    pub fn probeReachability(self: *Client) responses.ReachabilityProbeOutcome {
+        const result = self.healthCheckGet("/whoami") catch return .{ .successful = false };
+        return .{ .successful = result };
     }
 
     //
@@ -110,11 +132,60 @@ pub const Client = struct {
     }
 
     pub fn getNodeMemoryFootprint(self: *Client, name: []const u8) !std.json.Parsed(responses.NodeMemoryFootprint) {
-        const enc = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/memory", .{enc});
+        const path = try self.encodePathVar("/nodes/{s}/memory", &.{name});
         defer self.allocator.free(path);
         return self.getJson(responses.NodeMemoryFootprint, path);
+    }
+
+    pub fn getNodeMemoryFootprintRelative(self: *Client, name: []const u8) !std.json.Parsed(std.json.Value) {
+        const path = try self.encodePathVar("/nodes/{s}/memory/relative", &.{name});
+        defer self.allocator.free(path);
+        return self.getJson(std.json.Value, path);
+    }
+
+    /// The management API does not expose a per-node plugin endpoint, so this
+    /// returns the `enabled_plugins` list from the node's info endpoint.
+    /// Caller owns the returned arena; access plugins via `result.value`.
+    pub fn listNodePlugins(self: *Client, node: []const u8) !std.json.Parsed([][]const u8) {
+        const info = try self.getNodeInfo(node);
+        defer info.deinit();
+        const enabled = info.value.enabled_plugins orelse &.{};
+        return self.dupePluginList(enabled);
+    }
+
+    /// Returns the union of `enabled_plugins` across all cluster nodes,
+    /// sorted and deduplicated.
+    pub fn listAllClusterPlugins(self: *Client) !std.json.Parsed([][]const u8) {
+        const nodes = try self.listNodes();
+        defer nodes.deinit();
+
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.allocator);
+        for (nodes.value) |n| {
+            const enabled = n.enabled_plugins orelse continue;
+            for (enabled) |p| try seen.put(self.allocator, p, {});
+        }
+
+        var unique: std.ArrayList([]const u8) = .empty;
+        defer unique.deinit(self.allocator);
+        var it = seen.keyIterator();
+        while (it.next()) |k| try unique.append(self.allocator, k.*);
+        std.mem.sort([]const u8, unique.items, {}, lexicallyLess);
+
+        return self.dupePluginList(unique.items);
+    }
+
+    fn dupePluginList(self: *Client, source: []const []const u8) !std.json.Parsed([][]const u8) {
+        const arena = try self.allocator.create(std.heap.ArenaAllocator);
+        errdefer self.allocator.destroy(arena);
+        arena.* = .init(self.allocator);
+        errdefer arena.deinit();
+
+        const a = arena.allocator();
+        const out = try a.alloc([]const u8, source.len);
+        for (source, 0..) |s, i| out[i] = try a.dupe(u8, s);
+
+        return .{ .arena = arena, .value = out };
     }
 
     //
@@ -143,6 +214,12 @@ pub const Client = struct {
         try self.putJson(path, params);
     }
 
+    /// PUT /vhosts/:name performs an upsert; this method is provided for callers who
+    /// want to make the intent clear.
+    pub fn updateVhost(self: *Client, name: []const u8, params: requests.VirtualHostParams) !void {
+        return self.createVhost(name, params);
+    }
+
     pub fn deleteVhost(self: *Client, name: []const u8, idempotent: bool) !void {
         const path = try self.encodePath1("/vhosts", name);
         defer self.allocator.free(path);
@@ -150,19 +227,27 @@ pub const Client = struct {
     }
 
     pub fn enableVhostDeletionProtection(self: *Client, name: []const u8) !void {
-        const enc = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/vhosts/{s}/deletion/protection", .{enc});
+        const path = try self.encodePathVar("/vhosts/{s}/deletion/protection", &.{name});
         defer self.allocator.free(path);
         try self.httpSend(.POST, path, null);
     }
 
     pub fn disableVhostDeletionProtection(self: *Client, name: []const u8) !void {
-        const enc = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/vhosts/{s}/deletion/protection", .{enc});
+        const path = try self.encodePathVar("/vhosts/{s}/deletion/protection", &.{name});
         defer self.allocator.free(path);
         try self.httpDelete(path, null, false);
+    }
+
+    pub fn startVhostOnNode(self: *Client, vhost: []const u8, node: []const u8) !void {
+        const path = try self.encodePathVar("/vhosts/{s}/start/{s}", &.{ vhost, node });
+        defer self.allocator.free(path);
+        try self.httpSend(.POST, path, null);
+    }
+
+    pub fn alivenessTest(self: *Client, vhost: []const u8) !bool {
+        const path = try self.encodePath1("/aliveness-test", vhost);
+        defer self.allocator.free(path);
+        return self.healthCheckGet(path);
     }
 
     //
@@ -180,11 +265,9 @@ pub const Client = struct {
     }
 
     pub fn listConnectionsByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.ConnectionInfo) {
-        const path = try self.encodePath1("/vhosts", vhost);
+        const path = try self.encodePathVar("/vhosts/{s}/connections", &.{vhost});
         defer self.allocator.free(path);
-        const full = try std.fmt.allocPrint(self.allocator, "{s}/connections", .{path});
-        defer self.allocator.free(full);
-        return self.getJson([]responses.ConnectionInfo, full);
+        return self.getJson([]responses.ConnectionInfo, path);
     }
 
     pub fn getConnectionInfo(self: *Client, name: []const u8) !std.json.Parsed(responses.ConnectionInfo) {
@@ -200,17 +283,13 @@ pub const Client = struct {
     }
 
     pub fn listUserConnections(self: *Client, username: []const u8) !std.json.Parsed([]responses.UserConnectionInfo) {
-        const enc = try percentEncode(self.allocator, username);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/connections/username/{s}", .{enc});
+        const path = try self.encodePathVar("/connections/username/{s}", &.{username});
         defer self.allocator.free(path);
         return self.getJson([]responses.UserConnectionInfo, path);
     }
 
     pub fn closeUserConnections(self: *Client, username: []const u8, reason: ?[]const u8, idempotent: bool) !void {
-        const enc = try percentEncode(self.allocator, username);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/connections/username/{s}", .{enc});
+        const path = try self.encodePathVar("/connections/username/{s}", &.{username});
         defer self.allocator.free(path);
         try self.httpDelete(path, reason, idempotent);
     }
@@ -230,11 +309,9 @@ pub const Client = struct {
     }
 
     pub fn listChannelsByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.ChannelInfo) {
-        const path = try self.encodePath1("/vhosts", vhost);
+        const path = try self.encodePathVar("/vhosts/{s}/channels", &.{vhost});
         defer self.allocator.free(path);
-        const full = try std.fmt.allocPrint(self.allocator, "{s}/channels", .{path});
-        defer self.allocator.free(full);
-        return self.getJson([]responses.ChannelInfo, full);
+        return self.getJson([]responses.ChannelInfo, path);
     }
 
     pub fn listChannelsByVhostPaged(self: *Client, vhost: []const u8, params: requests.PaginationParams) !std.json.Parsed(responses.PaginatedResponse(responses.ChannelInfo)) {
@@ -252,11 +329,16 @@ pub const Client = struct {
     }
 
     pub fn listChannelsOnConnection(self: *Client, connection: []const u8) !std.json.Parsed([]responses.ChannelInfo) {
-        const enc = try percentEncode(self.allocator, connection);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/connections/{s}/channels", .{enc});
+        const path = try self.encodePathVar("/connections/{s}/channels", &.{connection});
         defer self.allocator.free(path);
         return self.getJson([]responses.ChannelInfo, path);
+    }
+
+    /// Lists AMQP 1.0 sessions multiplexed onto a single connection.
+    pub fn listSessionsOnConnection(self: *Client, connection: []const u8) !std.json.Parsed(std.json.Value) {
+        const path = try self.encodePathVar("/connections/{s}/sessions", &.{connection});
+        defer self.allocator.free(path);
+        return self.getJson(std.json.Value, path);
     }
 
     //
@@ -274,10 +356,10 @@ pub const Client = struct {
     }
 
     //
-    // Queues
+    // Queues, Streams
     //
 
-    /// Requires RabbitMQ 3.13+.
+    /// Requires RabbitMQ 3.13 or later. Earlier versions return 404.
     pub fn listQueuesWithDetails(self: *Client) !std.json.Parsed([]responses.QueueInfo) {
         return self.getJson([]responses.QueueInfo, "/queues/detailed");
     }
@@ -306,59 +388,52 @@ pub const Client = struct {
         return self.getJson(responses.PaginatedResponse(responses.QueueInfo), path);
     }
 
-    pub fn listQueuesByType(self: *Client, queue_type: []const u8) !std.json.Parsed([]responses.QueueInfo) {
-        var result = try self.getJson([]responses.QueueInfo, "/queues");
-        result.value = filterQueuesByType(result.value, queue_type);
+    pub fn listQueuesOfType(self: *Client, qt: commons.QueueType) !std.json.Parsed([]responses.QueueInfo) {
+        var result = try self.listQueues();
+        result.value = filterQueuesByType(result.value, qt.toApiString());
         return result;
     }
 
-    pub fn listQueuesByVhostAndType(self: *Client, vhost: []const u8, queue_type: []const u8) !std.json.Parsed([]responses.QueueInfo) {
-        const path = try self.encodePath1("/queues", vhost);
-        defer self.allocator.free(path);
-        var result = try self.getJson([]responses.QueueInfo, path);
-        result.value = filterQueuesByType(result.value, queue_type);
+    pub fn listQueuesByVhostOfType(self: *Client, vhost: []const u8, qt: commons.QueueType) !std.json.Parsed([]responses.QueueInfo) {
+        var result = try self.listQueuesByVhost(vhost);
+        result.value = filterQueuesByType(result.value, qt.toApiString());
         return result;
     }
 
     pub fn listClassicQueues(self: *Client) !std.json.Parsed([]responses.QueueInfo) {
-        return self.listQueuesByType("classic");
+        return self.listQueuesOfType(.classic);
     }
 
     pub fn listClassicQueuesByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.QueueInfo) {
-        return self.listQueuesByVhostAndType(vhost, "classic");
+        return self.listQueuesByVhostOfType(vhost, .classic);
     }
 
     pub fn listQuorumQueues(self: *Client) !std.json.Parsed([]responses.QueueInfo) {
-        return self.listQueuesByType("quorum");
+        return self.listQueuesOfType(.quorum);
     }
 
     pub fn listQuorumQueuesByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.QueueInfo) {
-        return self.listQueuesByVhostAndType(vhost, "quorum");
+        return self.listQueuesByVhostOfType(vhost, .quorum);
     }
 
     pub fn listStreams(self: *Client) !std.json.Parsed([]responses.QueueInfo) {
-        return self.listQueuesByType("stream");
+        return self.listQueuesOfType(.stream);
     }
 
     pub fn listStreamsByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.QueueInfo) {
-        return self.listQueuesByVhostAndType(vhost, "stream");
+        return self.listQueuesByVhostOfType(vhost, .stream);
     }
 
-    /// Page counts reflect all queue types, not just streams.
+    /// Filtering happens client-side, so `page_count` and `total_count` reflect
+    /// all queue types, not just streams.
     pub fn listStreamsPaged(self: *Client, params: requests.PaginationParams) !std.json.Parsed(responses.PaginatedResponse(responses.QueueInfo)) {
-        const path = try self.paginatedPath("/queues", params);
-        defer self.allocator.free(path);
-        var result = try self.getJson(responses.PaginatedResponse(responses.QueueInfo), path);
+        var result = try self.listQueuesPaged(params);
         result.value.items = filterQueuesByType(result.value.items, "stream");
         return result;
     }
 
-    pub fn listStreamsInPaged(self: *Client, vhost: []const u8, params: requests.PaginationParams) !std.json.Parsed(responses.PaginatedResponse(responses.QueueInfo)) {
-        const enc = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/{s}?page={d}&page_size={d}", .{ enc, params.page, params.page_size });
-        defer self.allocator.free(path);
-        var result = try self.getJson(responses.PaginatedResponse(responses.QueueInfo), path);
+    pub fn listStreamsByVhostPaged(self: *Client, vhost: []const u8, params: requests.PaginationParams) !std.json.Parsed(responses.PaginatedResponse(responses.QueueInfo)) {
+        var result = try self.listQueuesByVhostPaged(vhost, params);
         result.value.items = filterQueuesByType(result.value.items, "stream");
         return result;
     }
@@ -369,6 +444,10 @@ pub const Client = struct {
         return self.getJson(responses.QueueInfo, path);
     }
 
+    pub fn getStreamInfo(self: *Client, vhost: []const u8, name: []const u8) !std.json.Parsed(responses.QueueInfo) {
+        return self.getQueueInfo(vhost, name);
+    }
+
     pub fn declareQueue(self: *Client, vhost: []const u8, name: []const u8, params: requests.QueueParams) !void {
         const path = try self.encodePath2("/queues", vhost, name);
         defer self.allocator.free(path);
@@ -376,7 +455,7 @@ pub const Client = struct {
     }
 
     pub fn declareClassicQueue(self: *Client, vhost: []const u8, name: []const u8) !void {
-        try self.declareQueue(vhost, name, .{ .durable = true, .auto_delete = false });
+        try self.declareQueue(vhost, name, requests.QueueParams.newDurableClassicQueue());
     }
 
     pub fn declareQuorumQueue(self: *Client, vhost: []const u8, name: []const u8) !void {
@@ -395,10 +474,18 @@ pub const Client = struct {
         );
     }
 
+    pub fn declareStreamWithArguments(self: *Client, vhost: []const u8, name: []const u8, arguments: std.json.Value) !void {
+        try self.declareQueue(vhost, name, .{ .arguments = arguments });
+    }
+
     pub fn deleteQueue(self: *Client, vhost: []const u8, name: []const u8, idempotent: bool) !void {
         const path = try self.encodePath2("/queues", vhost, name);
         defer self.allocator.free(path);
         try self.httpDelete(path, null, idempotent);
+    }
+
+    pub fn deleteStream(self: *Client, vhost: []const u8, name: []const u8, idempotent: bool) !void {
+        return self.deleteQueue(vhost, name, idempotent);
     }
 
     pub fn deleteQueues(self: *Client, vhost: []const u8, names: []const []const u8, idempotent: bool) !void {
@@ -408,11 +495,7 @@ pub const Client = struct {
     }
 
     pub fn purgeQueue(self: *Client, vhost: []const u8, name: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_n = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/{s}/{s}/contents", .{ enc_v, enc_n });
+        const path = try self.encodePathVar("/queues/{s}/{s}/contents", &.{ vhost, name });
         defer self.allocator.free(path);
         try self.httpDelete(path, null, false);
     }
@@ -458,19 +541,19 @@ pub const Client = struct {
     }
 
     pub fn declareFanoutExchange(self: *Client, vhost: []const u8, name: []const u8) !void {
-        try self.declareExchange(vhost, name, .{ .type = "fanout" });
+        try self.declareExchange(vhost, name, requests.ExchangeParams.durableFanout());
     }
 
     pub fn declareTopicExchange(self: *Client, vhost: []const u8, name: []const u8) !void {
-        try self.declareExchange(vhost, name, .{ .type = "topic" });
+        try self.declareExchange(vhost, name, requests.ExchangeParams.durableTopic());
     }
 
     pub fn declareDirectExchange(self: *Client, vhost: []const u8, name: []const u8) !void {
-        try self.declareExchange(vhost, name, .{ .type = "direct" });
+        try self.declareExchange(vhost, name, requests.ExchangeParams.durableDirect());
     }
 
     pub fn declareHeadersExchange(self: *Client, vhost: []const u8, name: []const u8) !void {
-        try self.declareExchange(vhost, name, .{ .type = "headers" });
+        try self.declareExchange(vhost, name, requests.ExchangeParams.durableHeaders());
     }
 
     pub fn deleteExchange(self: *Client, vhost: []const u8, name: []const u8, idempotent: bool) !void {
@@ -500,109 +583,84 @@ pub const Client = struct {
     }
 
     pub fn listQueueBindings(self: *Client, vhost: []const u8, queue: []const u8) !std.json.Parsed([]responses.BindingInfo) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_q = try percentEncode(self.allocator, queue);
-        defer self.allocator.free(enc_q);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/{s}/{s}/bindings", .{ enc_v, enc_q });
+        const path = try self.encodePathVar("/queues/{s}/{s}/bindings", &.{ vhost, queue });
         defer self.allocator.free(path);
         return self.getJson([]responses.BindingInfo, path);
     }
 
     pub fn listExchangeBindingsWithSource(self: *Client, vhost: []const u8, exchange: []const u8) !std.json.Parsed([]responses.BindingInfo) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_e = try percentEncode(self.allocator, exchange);
-        defer self.allocator.free(enc_e);
-        const path = try std.fmt.allocPrint(self.allocator, "/exchanges/{s}/{s}/bindings/source", .{ enc_v, enc_e });
+        const path = try self.encodePathVar("/exchanges/{s}/{s}/bindings/source", &.{ vhost, exchange });
         defer self.allocator.free(path);
         return self.getJson([]responses.BindingInfo, path);
     }
 
     pub fn listExchangeBindingsWithDestination(self: *Client, vhost: []const u8, exchange: []const u8) !std.json.Parsed([]responses.BindingInfo) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_e = try percentEncode(self.allocator, exchange);
-        defer self.allocator.free(enc_e);
-        const path = try std.fmt.allocPrint(self.allocator, "/exchanges/{s}/{s}/bindings/destination", .{ enc_v, enc_e });
+        const path = try self.encodePathVar("/exchanges/{s}/{s}/bindings/destination", &.{ vhost, exchange });
         defer self.allocator.free(path);
         return self.getJson([]responses.BindingInfo, path);
     }
 
     pub fn listBindingsBetweenExchangeAndQueue(self: *Client, vhost: []const u8, exchange: []const u8, queue: []const u8) !std.json.Parsed([]responses.BindingInfo) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_e = try percentEncode(self.allocator, exchange);
-        defer self.allocator.free(enc_e);
-        const enc_q = try percentEncode(self.allocator, queue);
-        defer self.allocator.free(enc_q);
-        const path = try std.fmt.allocPrint(self.allocator, "/bindings/{s}/e/{s}/q/{s}", .{ enc_v, enc_e, enc_q });
+        const path = try self.encodePathVar("/bindings/{s}/e/{s}/q/{s}", &.{ vhost, exchange, queue });
         defer self.allocator.free(path);
         return self.getJson([]responses.BindingInfo, path);
     }
 
     pub fn listExchangeBindingsBetween(self: *Client, vhost: []const u8, source: []const u8, destination: []const u8) !std.json.Parsed([]responses.BindingInfo) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_s = try percentEncode(self.allocator, source);
-        defer self.allocator.free(enc_s);
-        const enc_d = try percentEncode(self.allocator, destination);
-        defer self.allocator.free(enc_d);
-        const path = try std.fmt.allocPrint(self.allocator, "/bindings/{s}/e/{s}/e/{s}", .{ enc_v, enc_s, enc_d });
+        const path = try self.encodePathVar("/bindings/{s}/e/{s}/e/{s}", &.{ vhost, source, destination });
         defer self.allocator.free(path);
         return self.getJson([]responses.BindingInfo, path);
     }
 
     pub fn bindQueue(self: *Client, vhost: []const u8, exchange: []const u8, queue: []const u8, params: requests.BindingParams) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_e = try percentEncode(self.allocator, exchange);
-        defer self.allocator.free(enc_e);
-        const enc_q = try percentEncode(self.allocator, queue);
-        defer self.allocator.free(enc_q);
-        const path = try std.fmt.allocPrint(self.allocator, "/bindings/{s}/e/{s}/q/{s}", .{ enc_v, enc_e, enc_q });
+        const path = try self.encodePathVar("/bindings/{s}/e/{s}/q/{s}", &.{ vhost, exchange, queue });
         defer self.allocator.free(path);
         try self.postJson(path, params);
     }
 
     pub fn bindExchange(self: *Client, vhost: []const u8, source: []const u8, destination: []const u8, params: requests.BindingParams) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_s = try percentEncode(self.allocator, source);
-        defer self.allocator.free(enc_s);
-        const enc_d = try percentEncode(self.allocator, destination);
-        defer self.allocator.free(enc_d);
-        const path = try std.fmt.allocPrint(self.allocator, "/bindings/{s}/e/{s}/e/{s}", .{ enc_v, enc_s, enc_d });
+        const path = try self.encodePathVar("/bindings/{s}/e/{s}/e/{s}", &.{ vhost, source, destination });
         defer self.allocator.free(path);
         try self.postJson(path, params);
     }
 
     pub fn deleteQueueBinding(self: *Client, vhost: []const u8, exchange: []const u8, queue: []const u8, properties_key: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_e = try percentEncode(self.allocator, exchange);
-        defer self.allocator.free(enc_e);
-        const enc_q = try percentEncode(self.allocator, queue);
-        defer self.allocator.free(enc_q);
-        const enc_p = try percentEncode(self.allocator, properties_key);
-        defer self.allocator.free(enc_p);
-        const path = try std.fmt.allocPrint(self.allocator, "/bindings/{s}/e/{s}/q/{s}/{s}", .{ enc_v, enc_e, enc_q, enc_p });
+        const path = try self.encodePathVar("/bindings/{s}/e/{s}/q/{s}/{s}", &.{ vhost, exchange, queue, properties_key });
         defer self.allocator.free(path);
         try self.httpDelete(path, null, false);
     }
 
     pub fn deleteExchangeBinding(self: *Client, vhost: []const u8, source: []const u8, destination: []const u8, properties_key: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_s = try percentEncode(self.allocator, source);
-        defer self.allocator.free(enc_s);
-        const enc_d = try percentEncode(self.allocator, destination);
-        defer self.allocator.free(enc_d);
-        const enc_p = try percentEncode(self.allocator, properties_key);
-        defer self.allocator.free(enc_p);
-        const path = try std.fmt.allocPrint(self.allocator, "/bindings/{s}/e/{s}/e/{s}/{s}", .{ enc_v, enc_s, enc_d, enc_p });
+        const path = try self.encodePathVar("/bindings/{s}/e/{s}/e/{s}/{s}", &.{ vhost, source, destination, properties_key });
         defer self.allocator.free(path);
         try self.httpDelete(path, null, false);
+    }
+
+    pub fn deleteBinding(self: *Client, params: requests.BindingDeletionParams) !void {
+        switch (params.destination_type) {
+            .queue => try self.deleteQueueBinding(params.vhost, params.source, params.destination, params.properties_key),
+            .exchange => try self.deleteExchangeBinding(params.vhost, params.source, params.destination, params.properties_key),
+        }
+    }
+
+    pub fn recreateBinding(self: *Client, info: responses.BindingInfo) !void {
+        const vhost = info.vhost orelse return error.BadRequest;
+        const source = info.source orelse return error.BadRequest;
+        const destination = info.destination orelse return error.BadRequest;
+        const dest_type = info.destination_type orelse "queue";
+        const rk = info.routing_key orelse "";
+
+        if (std.mem.eql(u8, dest_type, "queue")) {
+            try self.bindQueue(vhost, source, destination, .{
+                .routing_key = rk,
+                .arguments = info.arguments,
+            });
+        } else {
+            try self.bindExchange(vhost, source, destination, .{
+                .routing_key = rk,
+                .arguments = info.arguments,
+            });
+        }
     }
 
     //
@@ -649,6 +707,12 @@ pub const Client = struct {
         return self.getJson(responses.CurrentUser, "/whoami");
     }
 
+    pub fn listUserQueues(self: *Client, username: []const u8) !std.json.Parsed([]responses.QueueInfo) {
+        const path = try self.encodePathVar("/users/{s}/queues", &.{username});
+        defer self.allocator.free(path);
+        return self.getJson([]responses.QueueInfo, path);
+    }
+
     //
     // Permissions
     //
@@ -658,17 +722,13 @@ pub const Client = struct {
     }
 
     pub fn listPermissionsByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.PermissionInfo) {
-        const enc = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/vhosts/{s}/permissions", .{enc});
+        const path = try self.encodePathVar("/vhosts/{s}/permissions", &.{vhost});
         defer self.allocator.free(path);
         return self.getJson([]responses.PermissionInfo, path);
     }
 
     pub fn listPermissionsOf(self: *Client, username: []const u8) !std.json.Parsed([]responses.PermissionInfo) {
-        const enc = try percentEncode(self.allocator, username);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/users/{s}/permissions", .{enc});
+        const path = try self.encodePathVar("/users/{s}/permissions", &.{username});
         defer self.allocator.free(path);
         return self.getJson([]responses.PermissionInfo, path);
     }
@@ -685,6 +745,10 @@ pub const Client = struct {
         try self.putJson(path, params);
     }
 
+    pub fn declarePermissions(self: *Client, vhost: []const u8, username: []const u8, params: requests.PermissionParams) !void {
+        return self.grantPermissions(vhost, username, params);
+    }
+
     pub fn clearPermissions(self: *Client, vhost: []const u8, username: []const u8, idempotent: bool) !void {
         const path = try self.encodePath2("/permissions", vhost, username);
         defer self.allocator.free(path);
@@ -692,11 +756,7 @@ pub const Client = struct {
     }
 
     pub fn grantFullPermissions(self: *Client, vhost: []const u8, username: []const u8) !void {
-        try self.grantPermissions(vhost, username, .{
-            .configure = ".*",
-            .write = ".*",
-            .read = ".*",
-        });
+        try self.grantPermissions(vhost, username, requests.PermissionParams.fullAccess());
     }
 
     //
@@ -708,17 +768,13 @@ pub const Client = struct {
     }
 
     pub fn listTopicPermissionsByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.TopicPermissionInfo) {
-        const enc = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/vhosts/{s}/topic-permissions", .{enc});
+        const path = try self.encodePathVar("/vhosts/{s}/topic-permissions", &.{vhost});
         defer self.allocator.free(path);
         return self.getJson([]responses.TopicPermissionInfo, path);
     }
 
     pub fn listTopicPermissionsOf(self: *Client, username: []const u8) !std.json.Parsed([]responses.TopicPermissionInfo) {
-        const enc = try percentEncode(self.allocator, username);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/users/{s}/topic-permissions", .{enc});
+        const path = try self.encodePathVar("/users/{s}/topic-permissions", &.{username});
         defer self.allocator.free(path);
         return self.getJson([]responses.TopicPermissionInfo, path);
     }
@@ -733,6 +789,10 @@ pub const Client = struct {
         const path = try self.encodePath2("/topic-permissions", vhost, username);
         defer self.allocator.free(path);
         try self.putJson(path, params);
+    }
+
+    pub fn declareTopicPermissions(self: *Client, vhost: []const u8, username: []const u8, params: requests.TopicPermissionParams) !void {
+        return self.grantTopicPermissions(vhost, username, params);
     }
 
     pub fn clearTopicPermissions(self: *Client, vhost: []const u8, username: []const u8, idempotent: bool) !void {
@@ -774,17 +834,13 @@ pub const Client = struct {
     }
 
     pub fn listPoliciesForTarget(self: *Client, vhost: []const u8, target: commons.PolicyTarget) !std.json.Parsed([]responses.PolicyInfo) {
-        const path = try self.encodePath1("/policies", vhost);
-        defer self.allocator.free(path);
-        var result = try self.getJson([]responses.PolicyInfo, path);
+        var result = try self.listPoliciesByVhost(vhost);
         result.value = filterPoliciesByTarget(result.value, target.toApiString());
         return result;
     }
 
     pub fn listOperatorPoliciesForTarget(self: *Client, vhost: []const u8, target: commons.PolicyTarget) !std.json.Parsed([]responses.PolicyInfo) {
-        const path = try self.encodePath1("/operator-policies", vhost);
-        defer self.allocator.free(path);
-        var result = try self.getJson([]responses.PolicyInfo, path);
+        var result = try self.listOperatorPoliciesByVhost(vhost);
         result.value = filterPoliciesByTarget(result.value, target.toApiString());
         return result;
     }
@@ -879,10 +935,8 @@ pub const Client = struct {
         return self.healthCheckGet(path);
     }
 
-    pub fn healthCheckProtocolListener(self: *Client, protocol: []const u8) !bool {
-        const enc = try percentEncode(self.allocator, protocol);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/health/checks/protocol-listener/{s}", .{enc});
+    pub fn healthCheckProtocolListener(self: *Client, protocol: commons.SupportedProtocol) !bool {
+        const path = try self.encodePathVar("/health/checks/protocol-listener/{s}", &.{protocol.toApiString()});
         defer self.allocator.free(path);
         return self.healthCheckGet(path);
     }
@@ -909,6 +963,28 @@ pub const Client = struct {
         return self.healthCheckGet(path);
     }
 
+    pub fn healthCheckMetadataStoreInitialized(self: *Client) !bool {
+        return self.healthCheckGet("/health/checks/metadata-store/initialized");
+    }
+
+    pub fn healthCheckMetadataStoreInitializedWithData(self: *Client) !bool {
+        return self.healthCheckGet("/health/checks/metadata-store/initialized/with-data");
+    }
+
+    pub fn healthCheckReachedTargetClusterSize(self: *Client) !bool {
+        return self.healthCheckGet("/health/checks/reached-target-cluster-size");
+    }
+
+    pub fn healthCheckQuorumQueuesWithoutLeaders(self: *Client) !bool {
+        return self.healthCheckGet("/health/checks/quorum-queues-without-elected-leaders/all-vhosts/");
+    }
+
+    pub fn healthCheckQuorumQueuesWithoutLeadersIn(self: *Client, vhost: []const u8) !bool {
+        const path = try self.encodePathVar("/health/checks/quorum-queues-without-elected-leaders/vhost/{s}/", &.{vhost});
+        defer self.allocator.free(path);
+        return self.healthCheckGet(path);
+    }
+
     //
     // Feature Flags
     //
@@ -918,15 +994,25 @@ pub const Client = struct {
     }
 
     pub fn enableFeatureFlag(self: *Client, name: []const u8) !void {
-        const enc = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/feature-flags/{s}/enable", .{enc});
+        const path = try self.encodePathVar("/feature-flags/{s}/enable", &.{name});
         defer self.allocator.free(path);
         try self.httpSend(.PUT, path, "{}");
     }
 
+    /// PUT /feature-flags/all/enable does not exist; the broker only supports
+    /// enabling flags one at a time. We discover the disabled stable flags
+    /// from /feature-flags and enable each individually.
     pub fn enableAllStableFeatureFlags(self: *Client) !void {
-        try self.httpSend(.PUT, "/feature-flags", "{}");
+        const flags = try self.listFeatureFlags();
+        defer flags.deinit();
+        for (flags.value) |f| {
+            const state = f.state orelse continue;
+            const stability = f.stability orelse continue;
+            const name = f.name orelse continue;
+            if (!std.mem.eql(u8, state, "disabled")) continue;
+            if (!std.mem.eql(u8, stability, "stable")) continue;
+            try self.enableFeatureFlag(name);
+        }
     }
 
     //
@@ -945,7 +1031,7 @@ pub const Client = struct {
     // Definitions
     //
 
-    pub fn exportDefinitions(self: *Client) !std.json.Parsed(responses.DefinitionSet) {
+    pub fn exportClusterWideDefinitions(self: *Client) !std.json.Parsed(responses.DefinitionSet) {
         return self.getJson(responses.DefinitionSet, "/definitions");
     }
 
@@ -955,7 +1041,7 @@ pub const Client = struct {
         return self.getJson(responses.DefinitionSet, path);
     }
 
-    pub fn exportDefinitionsAsString(self: *Client) ![]u8 {
+    pub fn exportClusterWideDefinitionsAsString(self: *Client) ![]u8 {
         return self.httpGet("/definitions");
     }
 
@@ -965,7 +1051,7 @@ pub const Client = struct {
         return self.httpGet(path);
     }
 
-    pub fn importDefinitions(self: *Client, definitions_json: []const u8) !void {
+    pub fn importClusterWideDefinitions(self: *Client, definitions_json: []const u8) !void {
         try self.httpSend(.POST, "/definitions", definitions_json);
     }
 
@@ -973,6 +1059,18 @@ pub const Client = struct {
         const path = try self.encodePath1("/definitions", vhost);
         defer self.allocator.free(path);
         try self.httpSend(.POST, path, definitions_json);
+    }
+
+    pub fn exportDefinitions(self: *Client) !std.json.Parsed(responses.DefinitionSet) {
+        return self.exportClusterWideDefinitions();
+    }
+
+    pub fn exportDefinitionsAsString(self: *Client) ![]u8 {
+        return self.exportClusterWideDefinitionsAsString();
+    }
+
+    pub fn importDefinitions(self: *Client, definitions_json: []const u8) !void {
+        return self.importClusterWideDefinitions(definitions_json);
     }
 
     //
@@ -1013,20 +1111,21 @@ pub const Client = struct {
         try self.httpDelete(path, null, idempotent);
     }
 
-    pub fn clearAllRuntimeParameters(self: *Client, vhost: []const u8) !void {
+    /// /parameters returns parameters across all vhosts; we filter client-side.
+    pub fn clearAllRuntimeParametersIn(self: *Client, vhost: []const u8) !void {
         const result = try self.listRuntimeParameters();
         defer result.deinit();
         for (result.value) |p| {
-            if (p.vhost) |v| {
-                if (std.mem.eql(u8, v, vhost)) {
-                    if (p.component) |c| {
-                        if (p.name) |n| {
-                            try self.deleteRuntimeParameter(c, vhost, n, true);
-                        }
-                    }
-                }
-            }
+            const v = p.vhost orelse continue;
+            if (!std.mem.eql(u8, v, vhost)) continue;
+            const c = p.component orelse continue;
+            const n = p.name orelse continue;
+            try self.deleteRuntimeParameter(c, v, n, true);
         }
+    }
+
+    pub fn clearAllRuntimeParameters(self: *Client, vhost: []const u8) !void {
+        return self.clearAllRuntimeParametersIn(vhost);
     }
 
     pub fn clearAllRuntimeParametersOfComponent(self: *Client, vhost: []const u8, component: []const u8) !void {
@@ -1079,14 +1178,14 @@ pub const Client = struct {
         return self.getJson([]responses.UserLimitInfo, path);
     }
 
-    pub fn setUserLimit(self: *Client, username: []const u8, limit_name: []const u8, params: requests.LimitParams) !void {
-        const path = try self.encodePath2("/user-limits", username, limit_name);
+    pub fn setUserLimit(self: *Client, username: []const u8, limit: commons.UserLimitTarget, value: i64) !void {
+        const path = try self.encodePathVar("/user-limits/{s}/{s}", &.{ username, limit.toApiString() });
         defer self.allocator.free(path);
-        try self.putJson(path, params);
+        try self.putJson(path, requests.LimitParams{ .value = value });
     }
 
-    pub fn clearUserLimit(self: *Client, username: []const u8, limit_name: []const u8) !void {
-        const path = try self.encodePath2("/user-limits", username, limit_name);
+    pub fn clearUserLimit(self: *Client, username: []const u8, limit: commons.UserLimitTarget) !void {
+        const path = try self.encodePathVar("/user-limits/{s}/{s}", &.{ username, limit.toApiString() });
         defer self.allocator.free(path);
         try self.httpDelete(path, null, false);
     }
@@ -1105,14 +1204,14 @@ pub const Client = struct {
         return self.getJson([]responses.VhostLimitInfo, path);
     }
 
-    pub fn setVhostLimit(self: *Client, vhost: []const u8, limit_name: []const u8, params: requests.LimitParams) !void {
-        const path = try self.encodePath2("/vhost-limits", vhost, limit_name);
+    pub fn setVhostLimit(self: *Client, vhost: []const u8, limit: commons.VirtualHostLimitTarget, value: i64) !void {
+        const path = try self.encodePathVar("/vhost-limits/{s}/{s}", &.{ vhost, limit.toApiString() });
         defer self.allocator.free(path);
-        try self.putJson(path, params);
+        try self.putJson(path, requests.LimitParams{ .value = value });
     }
 
-    pub fn clearVhostLimit(self: *Client, vhost: []const u8, limit_name: []const u8) !void {
-        const path = try self.encodePath2("/vhost-limits", vhost, limit_name);
+    pub fn clearVhostLimit(self: *Client, vhost: []const u8, limit: commons.VirtualHostLimitTarget) !void {
+        const path = try self.encodePathVar("/vhost-limits/{s}/{s}", &.{ vhost, limit.toApiString() });
         defer self.allocator.free(path);
         try self.httpDelete(path, null, false);
     }
@@ -1138,6 +1237,12 @@ pub const Client = struct {
     }
 
     pub fn declareFederationUpstream(self: *Client, vhost: []const u8, name: []const u8, params: requests.FederationUpstreamParams) !void {
+        const path = try self.encodePath2("/parameters/federation-upstream", vhost, name);
+        defer self.allocator.free(path);
+        try self.putJson(path, params);
+    }
+
+    pub fn declareFederationUpstreamTyped(self: *Client, vhost: []const u8, name: []const u8, params: requests.TypedFederationUpstreamParams) !void {
         const path = try self.encodePath2("/parameters/federation-upstream", vhost, name);
         defer self.allocator.free(path);
         try self.putJson(path, params);
@@ -1186,11 +1291,7 @@ pub const Client = struct {
     }
 
     pub fn getShovelStatus(self: *Client, vhost: []const u8, name: []const u8) !std.json.Parsed(responses.ShovelStatus) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_n = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/shovels/vhost/{s}/{s}", .{ enc_v, enc_n });
+        const path = try self.encodePathVar("/shovels/vhost/{s}/{s}", &.{ vhost, name });
         defer self.allocator.free(path);
         return self.getJson(responses.ShovelStatus, path);
     }
@@ -1207,31 +1308,26 @@ pub const Client = struct {
         try self.putJson(path, .{ .value = params });
     }
 
-    pub fn deleteBinding(self: *Client, params: requests.BindingDeletionParams) !void {
-        switch (params.destination_type) {
-            .queue => try self.deleteQueueBinding(params.vhost, params.source, params.destination, params.properties_key),
-            .exchange => try self.deleteExchangeBinding(params.vhost, params.source, params.destination, params.properties_key),
-        }
+    pub fn restartShovel(self: *Client, vhost: []const u8, name: []const u8) !void {
+        const path = try self.encodePathVar("/shovels/vhost/{s}/{s}/restart", &.{ vhost, name });
+        defer self.allocator.free(path);
+        try self.httpSend(.DELETE, path, null);
     }
 
-    pub fn recreateBinding(self: *Client, info: responses.BindingInfo) !void {
-        const vhost = info.vhost orelse return error.BadRequest;
-        const source = info.source orelse return error.BadRequest;
-        const destination = info.destination orelse return error.BadRequest;
-        const dest_type = info.destination_type orelse "queue";
-        const rk = info.routing_key orelse "";
+    pub fn restartFederationLink(self: *Client, vhost: []const u8, id: []const u8, node: []const u8) !void {
+        const path = try self.encodePathVar("/federation-links/vhost/{s}/{s}/{s}/restart", &.{ vhost, id, node });
+        defer self.allocator.free(path);
+        try self.httpSend(.DELETE, path, null);
+    }
 
-        if (std.mem.eql(u8, dest_type, "queue")) {
-            try self.bindQueue(vhost, source, destination, .{
-                .routing_key = rk,
-                .arguments = info.arguments,
-            });
-        } else {
-            try self.bindExchange(vhost, source, destination, .{
-                .routing_key = rk,
-                .arguments = info.arguments,
-            });
-        }
+    pub fn listDownFederationLinks(self: *Client) !std.json.Parsed([]responses.FederationLink) {
+        return self.getJson([]responses.FederationLink, "/federation-links/state/down/");
+    }
+
+    pub fn listDownFederationLinksByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.FederationLink) {
+        const path = try self.encodePathVar("/federation-links/{s}/state/down", &.{vhost});
+        defer self.allocator.free(path);
+        return self.getJson([]responses.FederationLink, path);
     }
 
     //
@@ -1277,11 +1373,7 @@ pub const Client = struct {
     }
 
     pub fn listStreamPublishersOnConnection(self: *Client, vhost: []const u8, connection: []const u8) !std.json.Parsed([]responses.StreamPublisherInfo) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_c = try percentEncode(self.allocator, connection);
-        defer self.allocator.free(enc_c);
-        const path = try std.fmt.allocPrint(self.allocator, "/stream/connections/{s}/{s}/publishers", .{ enc_v, enc_c });
+        const path = try self.encodePathVar("/stream/connections/{s}/{s}/publishers", &.{ vhost, connection });
         defer self.allocator.free(path);
         return self.getJson([]responses.StreamPublisherInfo, path);
     }
@@ -1297,45 +1389,42 @@ pub const Client = struct {
     }
 
     pub fn listStreamConsumersOnConnection(self: *Client, vhost: []const u8, connection: []const u8) !std.json.Parsed([]responses.StreamConsumerInfo) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_c = try percentEncode(self.allocator, connection);
-        defer self.allocator.free(enc_c);
-        const path = try std.fmt.allocPrint(self.allocator, "/stream/connections/{s}/{s}/consumers", .{ enc_v, enc_c });
+        const path = try self.encodePathVar("/stream/connections/{s}/{s}/consumers", &.{ vhost, connection });
         defer self.allocator.free(path);
         return self.getJson([]responses.StreamConsumerInfo, path);
     }
 
     //
-    // Plugins
+    // Plugins & Extensions
     //
 
-    pub fn listNodePlugins(self: *Client, node: []const u8) !std.json.Parsed([]responses.PluginInfo) {
-        const enc = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/nodes/{s}/plugins", .{enc});
-        defer self.allocator.free(path);
-        return self.getJson([]responses.PluginInfo, path);
-    }
-
-    pub fn listExtensions(self: *Client) !std.json.Parsed([]responses.ExtensionInfo) {
-        return self.getJson([]responses.ExtensionInfo, "/extensions");
+    /// /extensions returns a heterogeneous array — some entries are
+    /// `{"javascript":"..."}` objects, others are empty arrays from plugins
+    /// that don't expose a UI extension. The result is left as a raw `Value`.
+    pub fn listExtensions(self: *Client) !std.json.Parsed(std.json.Value) {
+        return self.getJson(std.json.Value, "/extensions");
     }
 
     //
-    // OAuth & Authentication
+    // Authentication
     //
-
-    pub fn getOAuthConfiguration(self: *Client) !std.json.Parsed(responses.OAuthConfiguration) {
-        return self.getJson(responses.OAuthConfiguration, "/auth");
-    }
 
     pub fn getAuthAttempts(self: *Client, node: []const u8) !std.json.Parsed([]responses.AuthAttemptInfo) {
-        const enc = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/auth/attempts/{s}", .{enc});
+        const path = try self.encodePathVar("/auth/attempts/{s}", &.{node});
         defer self.allocator.free(path);
         return self.getJson([]responses.AuthAttemptInfo, path);
+    }
+
+    pub fn getAuthAttemptsBySource(self: *Client, node: []const u8) !std.json.Parsed([]responses.AuthAttemptInfo) {
+        const path = try self.encodePathVar("/auth/attempts/{s}/source", &.{node});
+        defer self.allocator.free(path);
+        return self.getJson([]responses.AuthAttemptInfo, path);
+    }
+
+    pub fn clearAuthAttempts(self: *Client, node: []const u8) !void {
+        const path = try self.encodePathVar("/auth/attempts/{s}", &.{node});
+        defer self.allocator.free(path);
+        try self.httpDelete(path, null, true);
     }
 
     //
@@ -1363,25 +1452,19 @@ pub const Client = struct {
     }
 
     pub fn enableSchemaDefinitionSyncOnNode(self: *Client, node: []const u8) !void {
-        const enc = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/schema-definition-sync/enable/{s}", .{enc});
+        const path = try self.encodePathVar("/schema-definition-sync/enable/{s}", &.{node});
         defer self.allocator.free(path);
         try self.httpSend(.POST, path, null);
     }
 
     pub fn disableSchemaDefinitionSyncOnNode(self: *Client, node: []const u8) !void {
-        const enc = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/schema-definition-sync/disable/{s}", .{enc});
+        const path = try self.encodePathVar("/schema-definition-sync/disable/{s}", &.{node});
         defer self.allocator.free(path);
         try self.httpSend(.POST, path, null);
     }
 
     pub fn getSchemaDefinitionSyncStatusOnNode(self: *Client, node: []const u8) !std.json.Parsed(responses.SchemaReplicationStatus) {
-        const enc = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/schema-definition-sync/status/{s}", .{enc});
+        const path = try self.encodePathVar("/schema-definition-sync/status/{s}", &.{node});
         defer self.allocator.free(path);
         return self.getJson(responses.SchemaReplicationStatus, path);
     }
@@ -1399,9 +1482,9 @@ pub const Client = struct {
         defer self.allocator.free(path);
         const full = try std.fmt.allocPrint(self.allocator, "{s}/publish", .{path});
         defer self.allocator.free(full);
-        // The API requires "properties" even when empty.
+        // The HTTP API requires "properties" even when empty.
         const wire = PublishRequest{
-            .properties = params.properties orelse .{ .object = std.json.ObjectMap.init(self.allocator) },
+            .properties = params.properties orelse .{ .object = .empty },
             .routing_key = params.routing_key,
             .payload = params.payload,
             .payload_encoding = params.payload_encoding,
@@ -1429,137 +1512,51 @@ pub const Client = struct {
     //
 
     pub fn getQuorumQueueStatus(self: *Client, vhost: []const u8, name: []const u8) !std.json.Parsed(std.json.Value) {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_n = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/quorum/{s}/{s}/status", .{ enc_v, enc_n });
+        const path = try self.encodePathVar("/queues/quorum/{s}/{s}/status", &.{ vhost, name });
         defer self.allocator.free(path);
         return self.getJson(std.json.Value, path);
     }
 
     pub fn addQuorumQueueReplica(self: *Client, vhost: []const u8, name: []const u8, node: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_n = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/quorum/{s}/{s}/replicas/add", .{ enc_v, enc_n });
+        const path = try self.encodePathVar("/queues/quorum/{s}/{s}/replicas/add", &.{ vhost, name });
         defer self.allocator.free(path);
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\"}}", .{node});
-        defer self.allocator.free(body);
-        try self.httpSend(.POST, path, body);
+        try self.postJson(path, .{ .node = node });
     }
 
     pub fn deleteQuorumQueueReplica(self: *Client, vhost: []const u8, name: []const u8, node: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_n = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/quorum/{s}/{s}/replicas/delete", .{ enc_v, enc_n });
+        const path = try self.encodePathVar("/queues/quorum/{s}/{s}/replicas/delete", &.{ vhost, name });
         defer self.allocator.free(path);
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"node\":\"{s}\"}}", .{node});
-        defer self.allocator.free(body);
-        try self.httpSend(.POST, path, body);
+        try self.postJson(path, .{ .node = node });
     }
 
     pub fn growQuorumQueueReplicas(self: *Client, node: []const u8) !void {
-        const enc = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/quorum/replicas/on/{s}/grow", .{enc});
+        const path = try self.encodePathVar("/queues/quorum/replicas/on/{s}/grow", &.{node});
         defer self.allocator.free(path);
         try self.httpSend(.POST, path, "{}");
     }
 
     pub fn shrinkQuorumQueueReplicas(self: *Client, node: []const u8) !void {
-        const enc = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/queues/quorum/replicas/on/{s}/shrink", .{enc});
+        const path = try self.encodePathVar("/queues/quorum/replicas/on/{s}/shrink", &.{node});
         defer self.allocator.free(path);
         try self.httpSend(.DELETE, path, null);
     }
 
     //
-    // Virtual Host Operations
+    // Password Hashing
     //
 
-    pub fn startVhostOnNode(self: *Client, vhost: []const u8, node: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_n = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/vhosts/{s}/start/{s}", .{ enc_v, enc_n });
+    pub fn hashPassword(self: *Client, password: []const u8) !std.json.Parsed(responses.HashPasswordResult) {
+        const path = try self.encodePathVar("/auth/hash_password/{s}", &.{password});
         defer self.allocator.free(path);
-        try self.httpSend(.POST, path, null);
+        return self.getJson(responses.HashPasswordResult, path);
     }
 
     //
-    // Shovel Operations
+    // Internal HTTP & JSON helpers
     //
-
-    pub fn restartShovel(self: *Client, vhost: []const u8, name: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_n = try percentEncode(self.allocator, name);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/shovels/vhost/{s}/{s}/restart", .{ enc_v, enc_n });
-        defer self.allocator.free(path);
-        try self.httpSend(.DELETE, path, null);
-    }
-
-    //
-    // Federation Operations
-    //
-
-    pub fn restartFederationLink(self: *Client, vhost: []const u8, id: []const u8, node: []const u8) !void {
-        const enc_v = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc_v);
-        const enc_id = try percentEncode(self.allocator, id);
-        defer self.allocator.free(enc_id);
-        const enc_n = try percentEncode(self.allocator, node);
-        defer self.allocator.free(enc_n);
-        const path = try std.fmt.allocPrint(self.allocator, "/federation-links/vhost/{s}/{s}/{s}/restart", .{ enc_v, enc_id, enc_n });
-        defer self.allocator.free(path);
-        try self.httpSend(.DELETE, path, null);
-    }
-
-    pub fn listDownFederationLinks(self: *Client) !std.json.Parsed([]responses.FederationLink) {
-        return self.getJson([]responses.FederationLink, "/federation-links/state/down/");
-    }
-
-    pub fn listDownFederationLinksByVhost(self: *Client, vhost: []const u8) !std.json.Parsed([]responses.FederationLink) {
-        const enc = try percentEncode(self.allocator, vhost);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/federation-links/{s}/state/down", .{enc});
-        defer self.allocator.free(path);
-        return self.getJson([]responses.FederationLink, path);
-    }
-
-    //
-    // Hash Password
-    //
-
-    pub fn hashPassword(self: *Client, password: []const u8) !std.json.Parsed(std.json.Value) {
-        const enc = try percentEncode(self.allocator, password);
-        defer self.allocator.free(enc);
-        const path = try std.fmt.allocPrint(self.allocator, "/auth/hash_password/{s}", .{enc});
-        defer self.allocator.free(path);
-        return self.getJson(std.json.Value, path);
-    }
-
-    //
-    // Effective Configuration
-    //
-
-    pub fn getEffectiveConfig(self: *Client) !std.json.Parsed(std.json.Value) {
-        return self.getJson(std.json.Value, "/config/effective");
-    }
 
     const json_stringify_options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
     const json_parse_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
-
-    //
-    // Internal HTTP helpers
-    //
 
     fn getJson(self: *Client, comptime T: type, path: []const u8) !std.json.Parsed(T) {
         const body = try self.httpGet(path);
@@ -1596,7 +1593,9 @@ pub const Client = struct {
         if (code >= 200 and code < 300) return;
         switch (status) {
             .unauthorized => return error.Unauthorized,
+            .forbidden => return error.Forbidden,
             .not_found => return error.NotFound,
+            .conflict => return error.Conflict,
             else => {},
         }
         if (code >= 500) return error.ServerError;
@@ -1621,6 +1620,7 @@ pub const Client = struct {
 
         const uri = std.Uri.parse(url) catch return error.HttpRequestFailed;
         var req = self.http_client.request(.GET, uri, .{
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
             .extra_headers = &.{
                 .{ .name = "authorization", .value = self.auth_header },
             },
@@ -1666,6 +1666,7 @@ pub const Client = struct {
 
         const uri = std.Uri.parse(url) catch return error.HttpRequestFailed;
         var req = self.http_client.request(method, uri, .{
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
             .extra_headers = &.{
                 .{ .name = "authorization", .value = self.auth_header },
                 .{ .name = "content-type", .value = "application/json" },
@@ -1759,20 +1760,72 @@ pub const Client = struct {
         defer self.allocator.free(enc3);
         return std.fmt.allocPrint(self.allocator, "{s}/{s}/{s}/{s}", .{ prefix, enc1, enc2, enc3 });
     }
+
+    /// Percent-encodes each segment and substitutes them into the format string in order.
+    /// The format string must use `{s}` for every encoded segment.
+    fn encodePathVar(self: *Client, comptime fmt: []const u8, segments: []const []const u8) ![]u8 {
+        const encoded = try self.allocator.alloc([]u8, segments.len);
+        var written: usize = 0;
+        defer {
+            for (encoded[0..written]) |e| self.allocator.free(e);
+            self.allocator.free(encoded);
+        }
+        for (segments, 0..) |s, i| {
+            encoded[i] = try percentEncode(self.allocator, s);
+            written = i + 1;
+        }
+        return formatWithSegments(self.allocator, fmt, encoded);
+    }
 };
 
+fn formatWithSegments(allocator: Allocator, comptime fmt: []const u8, segments: []const []const u8) ![]u8 {
+    var total: usize = 0;
+    var idx: usize = 0;
+    var seg_i: usize = 0;
+    const placeholder = "{s}";
+    while (idx < fmt.len) : (idx += 1) {
+        if (idx + placeholder.len <= fmt.len and std.mem.eql(u8, fmt[idx .. idx + placeholder.len], placeholder)) {
+            total += segments[seg_i].len;
+            seg_i += 1;
+            idx += placeholder.len - 1;
+        } else {
+            total += 1;
+        }
+    }
+    const out = try allocator.alloc(u8, total);
+    var w: usize = 0;
+    idx = 0;
+    seg_i = 0;
+    while (idx < fmt.len) : (idx += 1) {
+        if (idx + placeholder.len <= fmt.len and std.mem.eql(u8, fmt[idx .. idx + placeholder.len], placeholder)) {
+            const seg = segments[seg_i];
+            @memcpy(out[w..][0..seg.len], seg);
+            w += seg.len;
+            seg_i += 1;
+            idx += placeholder.len - 1;
+        } else {
+            out[w] = fmt[idx];
+            w += 1;
+        }
+    }
+    return out;
+}
+
 //
-// Filters
+// Client-side filters
 //
+
+fn lexicallyLess(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
 
 fn filterQueuesByType(queues: []responses.QueueInfo, queue_type: []const u8) []responses.QueueInfo {
     var count: usize = 0;
     for (queues) |q| {
-        if (q.type) |t| {
-            if (std.mem.eql(u8, t, queue_type)) {
-                queues[count] = q;
-                count += 1;
-            }
+        const t = q.type orelse continue;
+        if (std.mem.eql(u8, t, queue_type)) {
+            queues[count] = q;
+            count += 1;
         }
     }
     return queues[0..count];
@@ -1781,11 +1834,10 @@ fn filterQueuesByType(queues: []responses.QueueInfo, queue_type: []const u8) []r
 fn filterPoliciesByTarget(policies: []responses.PolicyInfo, target: []const u8) []responses.PolicyInfo {
     var count: usize = 0;
     for (policies) |p| {
-        if (p.@"apply-to") |at| {
-            if (std.mem.eql(u8, at, target)) {
-                policies[count] = p;
-                count += 1;
-            }
+        const at = p.@"apply-to" orelse continue;
+        if (std.mem.eql(u8, at, target)) {
+            policies[count] = p;
+            count += 1;
         }
     }
     return policies[0..count];
@@ -1794,11 +1846,10 @@ fn filterPoliciesByTarget(policies: []responses.PolicyInfo, target: []const u8) 
 fn filterMatchingPolicies(policies: []responses.PolicyInfo, name: []const u8) []responses.PolicyInfo {
     var count: usize = 0;
     for (policies) |p| {
-        if (p.pattern) |pattern| {
-            if (regexMatch(pattern, name)) {
-                policies[count] = p;
-                count += 1;
-            }
+        const pattern = p.pattern orelse continue;
+        if (regexMatch(pattern, name)) {
+            policies[count] = p;
+            count += 1;
         }
     }
     return policies[0..count];
@@ -1807,9 +1858,9 @@ fn filterMatchingPolicies(policies: []responses.PolicyInfo, name: []const u8) []
 const Regex = @import("regex").Regex;
 
 fn regexMatch(pattern: []const u8, input: []const u8) bool {
-    // page_allocator is intentional: these are short-lived compilations during
-    // client-side filtering, and we don't have access to the Client's allocator
-    // from a free function. The regex library uses a Thompson NFA (linear time).
+    // page_allocator is intentional: the regex library's internal allocator
+    // is not exposed through the Regex type, and these compilations are
+    // short-lived during client-side filtering.
     var re = Regex.compile(std.heap.page_allocator, pattern) catch return false;
     defer re.deinit();
     return re.partialMatch(input) catch false;
@@ -1819,7 +1870,7 @@ fn regexMatch(pattern: []const u8, input: []const u8) bool {
 // Utilities
 //
 
-/// Percent-encodes a string for use in URL path segments (RFC 3986).
+/// Percent-encodes a string for a URL path segment using the RFC 3986 unreserved set.
 pub fn percentEncode(allocator: Allocator, input: []const u8) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
@@ -1839,64 +1890,112 @@ pub fn percentEncode(allocator: Allocator, input: []const u8) ![]u8 {
 // Unit Tests
 //
 
-test "percent encode: passthrough for safe characters" {
-    const allocator = std.testing.allocator;
-    const result = try percentEncode(allocator, "hello-world_123");
-    defer allocator.free(result);
-    try std.testing.expectEqualSlices(u8, "hello-world_123", result);
+const testing = std.testing;
+
+test "percent encode passthrough for unreserved characters" {
+    const result = try percentEncode(testing.allocator, "hello-world_123.~");
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "hello-world_123.~", result);
 }
 
-//
-// Unit Tests
-//
-
-test "percent encode: encodes slash" {
-    const allocator = std.testing.allocator;
-    const result = try percentEncode(allocator, "/");
-    defer allocator.free(result);
-    try std.testing.expectEqualSlices(u8, "%2F", result);
+test "percent encode encodes slash" {
+    const result = try percentEncode(testing.allocator, "/");
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "%2F", result);
 }
 
-//
-// Unit Tests
-//
-
-test "percent encode: encodes spaces and special chars" {
-    const allocator = std.testing.allocator;
-    const result = try percentEncode(allocator, "my vhost");
-    defer allocator.free(result);
-    try std.testing.expectEqualSlices(u8, "my%20vhost", result);
+test "percent encode encodes spaces and special chars" {
+    const result = try percentEncode(testing.allocator, "my vhost");
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "my%20vhost", result);
 }
 
-//
-// Unit Tests
-//
-
-test "percent encode: encodes at sign and hash" {
-    const allocator = std.testing.allocator;
-    const result = try percentEncode(allocator, "user@host#1");
-    defer allocator.free(result);
-    try std.testing.expectEqualSlices(u8, "user%40host%231", result);
+test "percent encode encodes at sign and hash" {
+    const result = try percentEncode(testing.allocator, "user@host#1");
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "user%40host%231", result);
 }
 
-test "client init and deinit" {
-    const allocator = std.testing.allocator;
-    var threaded_io: std.Io.Threaded = .init(allocator, .{});
+test "percent encode preserves the empty string" {
+    const result = try percentEncode(testing.allocator, "");
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "", result);
+}
+
+test "percent encode handles UTF-8 bytes" {
+    // Each multi-byte UTF-8 byte must be percent-encoded individually.
+    const result = try percentEncode(testing.allocator, "café");
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "caf%C3%A9", result);
+}
+
+test "percent encode encodes plus and equals" {
+    const result = try percentEncode(testing.allocator, "a+b=c&d");
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, "a%2Bb%3Dc%26d", result);
+}
+
+test "formatWithSegments substitutes encoded segments in order" {
+    const out = try formatWithSegments(testing.allocator, "/a/{s}/b/{s}", &.{ "x", "y" });
+    defer testing.allocator.free(out);
+    try testing.expectEqualSlices(u8, "/a/x/b/y", out);
+}
+
+test "client init produces a Basic auth header" {
+    var threaded_io: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded_io.deinit();
-    var client = try Client.init(allocator, threaded_io.io(), .{});
+    var client = try Client.init(testing.allocator, threaded_io.io(), .{});
     defer client.deinit();
-    try std.testing.expect(std.mem.startsWith(u8, client.auth_header, "Basic "));
+    try testing.expect(std.mem.startsWith(u8, client.auth_header, "Basic "));
 }
 
-test "client init with custom options" {
-    const allocator = std.testing.allocator;
-    var threaded_io: std.Io.Threaded = .init(allocator, .{});
+test "client init preserves custom endpoint" {
+    var threaded_io: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded_io.deinit();
-    var client = try Client.init(allocator, threaded_io.io(), .{
+    var client = try Client.init(testing.allocator, threaded_io.io(), .{
         .endpoint = "http://rabbitmq:15672/api",
         .username = "admin",
         .password = "secret",
     });
     defer client.deinit();
-    try std.testing.expectEqualSlices(u8, "http://rabbitmq:15672/api", client.options.endpoint);
+    try testing.expectEqualSlices(u8, "http://rabbitmq:15672/api", client.options.endpoint);
+}
+
+test "filterQueuesByType selects only the requested type" {
+    var queues = [_]responses.QueueInfo{
+        .{ .name = "a", .type = "classic" },
+        .{ .name = "b", .type = "quorum" },
+        .{ .name = "c", .type = "stream" },
+        .{ .name = "d", .type = "quorum" },
+    };
+    const filtered = filterQueuesByType(&queues, "quorum");
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+    try testing.expectEqualStrings("b", filtered[0].name);
+    try testing.expectEqualStrings("d", filtered[1].name);
+}
+
+test "filterPoliciesByTarget keeps only matching apply-to" {
+    var policies = [_]responses.PolicyInfo{
+        .{ .name = "p1", .@"apply-to" = "queues" },
+        .{ .name = "p2", .@"apply-to" = "exchanges" },
+        .{ .name = "p3", .@"apply-to" = "queues" },
+    };
+    const filtered = filterPoliciesByTarget(&policies, "queues");
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+}
+
+test "filterMatchingPolicies matches name against pattern" {
+    var policies = [_]responses.PolicyInfo{
+        .{ .name = "p1", .pattern = "^logs\\." },
+        .{ .name = "p2", .pattern = "^events\\." },
+        .{ .name = "p3", .pattern = "" },
+    };
+    const filtered = filterMatchingPolicies(&policies, "logs.app");
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+    try testing.expectEqualStrings("p1", filtered[0].name.?);
+    try testing.expectEqualStrings("p3", filtered[1].name.?);
+}
+
+test "regexMatch returns false on invalid pattern" {
+    try testing.expect(!regexMatch("[invalid(", "anything"));
 }

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+// Copyright (c) 2026 Michael Klishin
+
 const h = @import("helpers.zig");
 const std = @import("std");
 
@@ -108,13 +111,13 @@ test "declare exchange with arguments" {
     const exchange_name = "zig.test.args.exchange";
     client.deleteExchange("/", exchange_name, true) catch {};
 
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(h.allocator);
+    try args.put(h.allocator, "alternate-exchange", .{ .string = "amq.fanout" });
+
     try client.declareExchange("/", exchange_name, .{
         .type = "direct",
-        .arguments = .{ .object = blk: {
-            var map = std.json.ObjectMap.init(h.allocator);
-            map.put("alternate-exchange", .{ .string = "amq.fanout" }) catch unreachable;
-            break :blk map;
-        } },
+        .arguments = .{ .object = args },
     });
 
     const info = try client.getExchangeInfo("/", exchange_name);
