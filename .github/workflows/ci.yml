@@ -58,6 +58,7 @@ jobs:
           - "4.0"
           - "4.1"
           - "4.2"
+          - "4.3"
         os:
           - "ubuntu-24.04"
     runs-on: ${{ matrix.os }}
@@ -98,6 +99,7 @@ jobs:
           - "4.0"
           - "4.1"
           - "4.2"
+          - "4.3"
         os:
           - "ubuntu-24.04"
     runs-on: ${{ matrix.os }}
