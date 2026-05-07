@@ -60,8 +60,8 @@ test "health check: node is quorum critical" {
 }
 
 test "health check: is in service" {
-    // Endpoint requires RabbitMQ 4.x
-    if (!try h.rabbitmqVersionIsAtLeast(4, 0, 0)) return;
+    // Endpoint requires RabbitMQ 4.1+
+    if (!try h.rabbitmqVersionIsAtLeast(4, 1, 0)) return;
 
     var client = try h.openClient();
     defer client.deinit();
@@ -70,8 +70,8 @@ test "health check: is in service" {
 }
 
 test "health check: ready to serve clients" {
-    // Endpoint requires RabbitMQ 4.x
-    if (!try h.rabbitmqVersionIsAtLeast(4, 0, 0)) return;
+    // Endpoint requires RabbitMQ 4.1+
+    if (!try h.rabbitmqVersionIsAtLeast(4, 1, 0)) return;
 
     var client = try h.openClient();
     defer client.deinit();
@@ -80,8 +80,8 @@ test "health check: ready to serve clients" {
 }
 
 test "health check: below connection limit" {
-    // Endpoint requires RabbitMQ 4.x (3.x has /health/checks/below-connection-limit instead)
-    if (!try h.rabbitmqVersionIsAtLeast(4, 0, 0)) return;
+    // Endpoint requires RabbitMQ 4.1+ (/health/checks/below-node-connection-limit)
+    if (!try h.rabbitmqVersionIsAtLeast(4, 1, 0)) return;
 
     var client = try h.openClient();
     defer client.deinit();
