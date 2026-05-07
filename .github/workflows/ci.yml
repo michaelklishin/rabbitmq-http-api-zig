@@ -1,27 +1,203 @@
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches:
+      - "main"
+    paths:
+      - ".github/workflows/ci.yml"
+      - "build.zig"
+      - "build.zig.zon"
+      - "src/**"
+      - "tests/**"
+      - "bin/ci/before_build.sh"
+  pull_request: {}
+
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.16.0"
+
 jobs:
-  test:
+  lint:
+    name: Lint (zig fmt)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig fmt --check build.zig build.zig.zon src/ tests/
+
+  unit-tests:
+    name: Unit and pure property tests
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os:
+          - "ubuntu-22.04"
+          - "ubuntu-24.04"
+          - "ubuntu-24.04-arm"
+          - "macos-latest"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
-      - run: zig build test
-      - run: zig fmt --check src/ tests/
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test --summary all
+
+  integration-tests:
+    name: Integration tests
+    strategy:
+      fail-fast: false
+      matrix:
+        rabbitmq-series:
+          - "3.13"
+          - "4.0"
+          - "4.1"
+          - "4.2"
+        os:
+          - "ubuntu-24.04"
+    runs-on: ${{ matrix.os }}
+
+    services:
+      rabbitmq:
+        image: rabbitmq:${{ matrix.rabbitmq-series }}-management
+        ports:
+          - 15672:15672
+          - 5672:5672
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Wait for node to start booting
+        run: sleep 15
+
+      - name: Pre-configure the node
+        run: ZIG_HTTP_API_CLIENT_RABBITMQCTL=DOCKER:${{ job.services.rabbitmq.id }} bin/ci/before_build.sh
+
+      - name: Wait for the script changes to be applied
+        run: sleep 10
+
+      - name: Run integration tests
+        run: zig build integration-test --summary all
+
+  tls-tests:
+    name: TLS tests
+    strategy:
+      fail-fast: false
+      matrix:
+        rabbitmq-series:
+          - "3.13"
+          - "4.0"
+          - "4.1"
+          - "4.2"
+        os:
+          - "ubuntu-24.04"
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Clone tls-gen
+        run: git clone --depth 1 https://github.com/rabbitmq/tls-gen.git target/tls-gen
+
+      - name: Generate TLS certificates
+        run: |
+          cd target/tls-gen/basic
+          make CN=localhost
+
+      - name: Create certs directory
+        run: mkdir -p tests/tls/certs
+
+      - name: Copy certificates
+        run: |
+          cp target/tls-gen/basic/result/ca_certificate.pem tests/tls/certs/
+          cp target/tls-gen/basic/result/server_localhost_certificate.pem tests/tls/certs/server_certificate.pem
+          cp target/tls-gen/basic/result/server_localhost_key.pem tests/tls/certs/server_key.pem
+          cp target/tls-gen/basic/result/client_localhost_certificate.pem tests/tls/certs/client_certificate.pem
+          cp target/tls-gen/basic/result/client_localhost_key.pem tests/tls/certs/client_key.pem
+          chmod og+r tests/tls/certs/*
+
+      - name: Create RabbitMQ TLS configuration
+        run: |
+          cat > tests/tls/certs/rabbitmq.conf << 'EOF'
+          management.ssl.port       = 15671
+          management.ssl.cacertfile = /certs/ca_certificate.pem
+          management.ssl.certfile   = /certs/server_certificate.pem
+          management.ssl.keyfile    = /certs/server_key.pem
+          management.tcp.port       = 15672
+          loopback_users            = none
+          EOF
+          sed -i 's/^[[:space:]]*//' tests/tls/certs/rabbitmq.conf
+          echo -n "rabbitmq-test-cookie" > tests/tls/certs/.erlang.cookie
+          chmod 600 tests/tls/certs/.erlang.cookie
+
+      - name: Start RabbitMQ with TLS
+        run: |
+          docker run -d --name rabbitmq-tls \
+            -p 15671:15671 \
+            -p 15672:15672 \
+            -p 5672:5672 \
+            -v ${{ github.workspace }}/tests/tls/certs/.erlang.cookie:/var/lib/rabbitmq/.erlang.cookie \
+            -v ${{ github.workspace }}/tests/tls/certs:/certs:ro \
+            -v ${{ github.workspace }}/tests/tls/certs/rabbitmq.conf:/etc/rabbitmq/conf.d/10-tls.conf:ro \
+            rabbitmq:${{ matrix.rabbitmq-series }}-management
+
+      - name: Wait for RabbitMQ to start
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec rabbitmq-tls rabbitmqctl await_startup --timeout 60; then
+              echo "RabbitMQ is ready"
+              exit 0
+            fi
+            echo "Waiting for container... ($i/30)"
+            sleep 2
+          done
+          echo "RabbitMQ failed to start. Container logs:"
+          docker logs rabbitmq-tls
+          exit 1
+
+      - name: Verify TLS listener
+        run: docker exec rabbitmq-tls rabbitmq-diagnostics listeners
+
+      - name: Add guest user and default vhost
+        run: |
+          docker exec rabbitmq-tls rabbitmqctl add_vhost / || true
+          docker exec rabbitmq-tls rabbitmqctl add_user guest guest || true
+          docker exec rabbitmq-tls rabbitmqctl set_permissions -p / guest ".*" ".*" ".*"
+
+      - name: Run TLS tests
+        run: TLS_CERTS_DIR=${{ github.workspace }}/tests/tls/certs zig build tls-test --summary all
+
+      - name: Stop RabbitMQ container
+        if: always()
+        run: docker rm -f rabbitmq-tls || true
 
   cross-compile:
-    runs-on: ubuntu-latest
+    name: Cross-compile (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-gnu
+          - x86_64-linux-gnu
+          - aarch64-macos-none
+          - x86_64-macos-none
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
-      - run: zig build -Dtarget=aarch64-linux-gnu
-      - run: zig build -Dtarget=x86_64-linux-gnu
-      - run: zig build -Dtarget=aarch64-macos-none
-      - run: zig build -Dtarget=x86_64-macos-none
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build -Dtarget=${{ matrix.target }}
