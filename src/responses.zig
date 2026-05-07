@@ -3,6 +3,23 @@
 
 const std = @import("std");
 
+// Handle cases where empty proplists are serialized by the HTTP API as an empty array instead of an empty object.
+fn parseObjectToleratingTransientEmptyProplists(comptime T: type, allocator: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) !T {
+    return switch (value) {
+        .array, .null => T{},
+        .object => |obj| blk: {
+            var result: T = .{};
+            inline for (std.meta.fields(T)) |field| {
+                if (obj.get(field.name)) |v| {
+                    @field(result, field.name) = try std.json.parseFromValueLeaky(field.type, allocator, v, options);
+                }
+            }
+            break :blk result;
+        },
+        else => error.UnexpectedToken,
+    };
+}
+
 //
 // Generic Pagination
 //
@@ -56,6 +73,15 @@ pub const MessageStats = struct {
     drop_unroutable_details: ?RateDetails = null,
     disk_reads: ?u64 = null,
     disk_writes: ?u64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return parseObjectToleratingTransientEmptyProplists(@This(), allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return parseObjectToleratingTransientEmptyProplists(@This(), allocator, value, options);
+    }
 };
 
 //
@@ -310,6 +336,15 @@ pub const ConnectionDetails = struct {
     name: ?[]const u8 = null,
     peer_host: ?[]const u8 = null,
     peer_port: ?u16 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return parseObjectToleratingTransientEmptyProplists(@This(), allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, value: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return parseObjectToleratingTransientEmptyProplists(@This(), allocator, value, options);
+    }
 };
 
 //
@@ -797,3 +832,31 @@ pub const ErrorDetails = struct {
         return self.reason orelse self.@"error";
     }
 };
+
+//
+// Tests
+//
+
+test "ChannelInfo tolerates connection_details and message_stats serialized as []" {
+    const testing = std.testing;
+    const json =
+        \\[{"name":"x","number":1,"connection_details":[],"message_stats":[]}]
+    ;
+    const parsed = try std.json.parseFromSlice([]ChannelInfo, testing.allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expect(parsed.value.len == 1);
+    try testing.expect(parsed.value[0].connection_details != null);
+    try testing.expect(parsed.value[0].message_stats != null);
+    try testing.expect(parsed.value[0].connection_details.?.peer_host == null);
+}
+
+test "ChannelInfo accepts populated connection_details" {
+    const testing = std.testing;
+    const json =
+        \\{"name":"x","connection_details":{"name":"c","peer_host":"h","peer_port":1234}}
+    ;
+    const parsed = try std.json.parseFromSlice(ChannelInfo, testing.allocator, json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqualStrings("h", parsed.value.connection_details.?.peer_host.?);
+    try testing.expect(parsed.value.connection_details.?.peer_port.? == 1234);
+}

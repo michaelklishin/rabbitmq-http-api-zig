@@ -131,6 +131,9 @@ test "PermissionParams.readOnly grants read but not write" {
 }
 
 test "list user queues" {
+    // /users/:user/queues endpoint requires RabbitMQ 4.x
+    if (!try h.rabbitmqVersionIsAtLeast(4, 0, 0)) return;
+
     var admin = try h.openClient();
     defer admin.deinit();
 

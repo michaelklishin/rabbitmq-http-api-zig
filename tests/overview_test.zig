@@ -54,6 +54,9 @@ test "rebalance queue leaders" {
 }
 
 test "server version returns a non-empty string" {
+    // /version endpoint requires RabbitMQ 4.x
+    if (!try h.rabbitmqVersionIsAtLeast(4, 0, 0)) return;
+
     var client = try h.openClient();
     defer client.deinit();
 

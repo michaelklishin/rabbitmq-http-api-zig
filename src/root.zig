@@ -15,6 +15,9 @@ pub const commons = @import("commons.zig");
 pub const builders = @import("builders.zig");
 
 test {
-    const std = @import("std");
-    std.testing.refAllDecls(@This());
+    _ = @import("client.zig");
+    _ = @import("responses.zig");
+    _ = @import("requests.zig");
+    _ = @import("commons.zig");
+    _ = @import("builders.zig");
 }

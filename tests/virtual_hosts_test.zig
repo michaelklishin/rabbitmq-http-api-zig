@@ -82,6 +82,9 @@ test "delete nonexistent vhost fails" {
 }
 
 test "virtual host deletion protection" {
+    // Endpoint requires RabbitMQ 4.x
+    if (!try h.rabbitmqVersionIsAtLeast(4, 0, 0)) return;
+
     var client = try h.openClient();
     defer client.deinit();
 
